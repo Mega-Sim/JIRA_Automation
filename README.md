@@ -1,8 +1,8 @@
-# Jira SCCB Automation
+# Jira 이슈 처리 Automation
 
-SEMES AMHS/AMHS_SW 프로젝트의 SCCB(Software Change Control Board) 검증 및 자동 완료 처리 도구입니다.
+JIRA 프로젝트의 SW 변경점 관리 이슈들의 검증 및 자동 완료 처리 도구입니다.
 
-Jira 이슈를 일괄 조회하고, SCCB 필수 필드(SCCB 상태, 해결책, End Date 등)를 자동으로 세팅하여 이슈를 Complete 처리합니다.
+Jira 이슈를 일괄 조회하고, SW변경 필수 필드(진행 상태, 해결책, End Date 등)를 자동으로 세팅하여 이슈를 Complete 처리합니다.
 
 ---
 
@@ -22,9 +22,9 @@ Jira 이슈를 일괄 조회하고, SCCB 필수 필드(SCCB 상태, 해결책, E
 ### 2. 3가지 조회 모드 (프리셋 JQL)
 | 버튼 | 모드 | 설명 |
 |------|------|------|
-| **SCCB 미대상** | `not_target` | SCCB 상태 = "미 대상" 이슈 조회 |
-| **SCCB 대상** | `target` | SCCB 상태가 비어있거나 완료/사전완료 이슈 조회 |
-| **VOC 완료처리** | `voc_complete` | 이번주 SCCB URL에서 이슈 키를 파싱하여 연결된 SW_VOC 이슈를 일괄 완료 처리 |
+| **SW 변경 미대상** | `not_target` | SW 변경 상태 = "미 대상" 이슈 조회 |
+| **SW 변경 대상** | `target` | SW 변경 상태가 비어있거나 완료/사전완료 이슈 조회 |
+| **VOC 완료처리** | `voc_complete` | 이번주 SW 변경 URL에서 이슈 키를 파싱하여 연결된 SW_VOC 이슈를 일괄 완료 처리 |
 
 JQL을 직접 수정하여 커스텀 검색도 가능합니다.
 
@@ -51,7 +51,7 @@ JQL을 직접 수정하여 커스텀 검색도 가능합니다.
 
 ### 4. 선택 이슈 Complete 자동 처리
 선택한 이슈에 대해 Jira Transition을 자동 실행합니다:
-- SCCB 상태 → `SCCB 완료` 자동 세팅
+- SW 변경 상태 → `SW 변경 완료` 자동 세팅
 - 해결책 → `완료` 자동 세팅
 - End Date → 오늘 날짜(Asia/Seoul 기준) 자동 세팅
 - Transition 탐색: `완료` / `Done` / Done 카테고리 순서로 자동 매칭
@@ -93,7 +93,7 @@ python -m sccb_app.app
 |------|----|
 | 기본 Base URL | `https://jira-stms.semes.com:18080` |
 | End Date API 형식 | `YYYY-MM-DD` (하이픈 고정) |
-| SCCB 상태 값 | `SCCB 완료` |
+| SW 변경 상태 값 | `SW 변경 완료` |
 | 해결책 값 | `완료` |
 | 타임존 | `Asia/Seoul` |
 
