@@ -7,6 +7,7 @@ import html as _html
 import json
 import time
 from html.parser import HTMLParser
+from urllib.parse import urljoin
 import time as _time
 
 
@@ -67,6 +68,104 @@ class _TableExtractor(HTMLParser):
             self._cur_cell_chunks.append(data)
 
 
+class _ConfluenceCopyFormParser(HTMLParser):
+    """Confluence의 페이지 복사 화면에서 저장용 form 값만 추출한다.
+
+    Confluence Server/Data Center의 페이지 복사는 공개 REST API가 아니라 화면 action을
+    통해 수행된다. 서버가 렌더링한 form의 hidden token과 현재 버전별 필수 필드를 그대로
+    제출하기 위해, 특정 버전의 필드명에 의존하지 않고 form을 읽는다.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self._form = None
+        self._textarea_name = None
+        self._textarea_chunks = []
+        self._select_name = None
+        self._select_options = []
+
+    @staticmethod
+    def _attrs(attrs):
+        return {str(k).lower(): "" if v is None else str(v) for k, v in attrs}
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        a = self._attrs(attrs)
+        if tag == "form":
+            self._form = {
+                "action": a.get("action", ""),
+                "method": a.get("method", "get").lower(),
+                "fields": [],
+                "checkboxes": [],
+            }
+            return
+        if self._form is None:
+            return
+
+        if tag == "input":
+            name = a.get("name", "")
+            input_type = a.get("type", "text").lower()
+            if not name or "disabled" in a:
+                return
+            # checkbox/radio는 선택된 값만 전송된다. 복사 화면의 첨부파일
+            # 선택지는 이후 강제로 포함할 수 있도록 메타데이터도 보관한다.
+            if input_type in {"checkbox", "radio"}:
+                self._form["checkboxes"].append({
+                    "name": name,
+                    "value": a.get("value", "true"),
+                    "checked": "checked" in a,
+                })
+                if "checked" not in a:
+                    return
+            if input_type in {"submit", "button", "reset", "image", "file"}:
+                return
+            self._form["fields"].append((name, a.get("value", "")))
+        elif tag == "textarea":
+            self._textarea_name = a.get("name", "") if "disabled" not in a else ""
+            self._textarea_chunks = []
+        elif tag == "select":
+            self._select_name = a.get("name", "") if "disabled" not in a else ""
+            self._select_options = []
+        elif tag == "option" and self._select_name:
+            self._select_options.append({
+                "value": a.get("value", ""),
+                "selected": "selected" in a,
+                "text": [],
+            })
+
+    def handle_data(self, data):
+        if self._textarea_name:
+            self._textarea_chunks.append(data)
+        elif self._select_name and self._select_options:
+            self._select_options[-1]["text"].append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "textarea" and self._form is not None:
+            if self._textarea_name:
+                self._form["fields"].append((self._textarea_name, "".join(self._textarea_chunks)))
+            self._textarea_name = None
+            self._textarea_chunks = []
+        elif tag == "select" and self._form is not None:
+            if self._select_name and self._select_options:
+                selected = next((x for x in self._select_options if x["selected"]), self._select_options[0])
+                value = selected["value"] or "".join(selected["text"])
+                self._form["fields"].append((self._select_name, value))
+            self._select_name = None
+            self._select_options = []
+        elif tag == "form" and self._form is not None:
+            self.forms.append(self._form)
+            self._form = None
+
+    def find_copy_form(self):
+        for form in self.forms:
+            action = (form.get("action") or "").lower()
+            if "docopypage.action" in action:
+                return form
+        return None
+
+
 class JiraClient:
     def __init__(self, base_url: str, user: str, password: str, verify_ssl: bool = True, timeout: int = 30):
         self.base_url = (base_url or "").rstrip("/")
@@ -88,10 +187,18 @@ class JiraClient:
     def _session(self) -> requests.Session:
         s = getattr(self._tls, "session", None)
         if s is None:
+            from urllib3.util.retry import Retry
             s = requests.Session()
             s.auth = self._auth()
             s.verify = self.verify_ssl
-            adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
+            retry = Retry(
+                total=3,
+                backoff_factor=0.5,          # 0.5s, 1s, 2s 간격 재시도
+                status_forcelist={500, 502, 503, 504},
+                allowed_methods={"GET"},
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=retry)
             s.mount("http://", adapter)
             s.mount("https://", adapter)
             self._tls.session = s
@@ -170,7 +277,7 @@ class JiraClient:
         if not text:
             return ""
         m = re.search(r"(\d+)\s*자", text)
-        if m:
+        if m and int(m.group(1)) >= 10:
             return f"{m.group(1)} 자"
         try:
             obj = json.loads(text)
@@ -186,7 +293,7 @@ class JiraClient:
             seen.add(cid)
             if isinstance(cur, str):
                 m = re.search(r"(\d+)\s*자", cur)
-                if m:
+                if m and int(m.group(1)) >= 10:
                     return f"{m.group(1)} 자"
             elif isinstance(cur, dict):
                 for v in cur.values():
@@ -268,6 +375,9 @@ class JiraClient:
             return ""
         desc = m.group(1)
         plain = re.sub(r"\s+", "", desc)
+        # 비정상 범위(너무 작거나 너무 큰 값)는 오탐으로 판단
+        if len(plain) < 10 or len(plain) > 50000:
+            return ""
         return f"{len(plain)} 자"
 
     def get_body_length_string_from_ui(self, issue_key: str) -> str:
@@ -359,7 +469,7 @@ class JiraClient:
                     return norm
             return ""
         s = str(value).strip().upper()
-        m = re.search(r'([ABCD])', s)
+        m = re.search(r'\b([ABCD])\b', s)
         if m:
             return m.group(1)
         m = re.search(r'([ABCD])', s)
@@ -454,40 +564,61 @@ class JiraClient:
         return issue_id, project_id
 
     def _get_aio_traceability_issue_json_candidates(self, issue_key: str, issue_id: str | None, project_id: int | None):
+        """AIO traceability 후보 endpoint를 모두 조회한다.
+
+        기존 구현의 문제:
+        - 첫 번째 non-empty 응답만 반환했다.
+        - requirement 응답이 cycle=0 정보만 가지고 있고 TC 목록은 associations 쪽에 있는 경우,
+          첫 응답에서 멈추므로 실제 Test Case 6개를 끝까지 보지 못했다.
+
+        반환:
+        - [(label, payload), ...]
+        - 상위 로직은 각 payload에서 TC 개수를 추출한 뒤 최대값을 채택한다.
+        """
         issue_key = str(issue_key or "").strip()
         issue_id = str(issue_id or "").strip()
         paths = []
         seen = set()
 
-        def add(path, params=None):
+        def add(label, path, params=None):
             key = (path, tuple(sorted((params or {}).items())))
             if key in seen:
                 return
             seen.add(key)
-            paths.append((path, params or None))
+            paths.append((label, path, params or None))
 
-        # 실제 사내 AIO endpoint 변형을 폭넓게 시도
         if project_id is not None:
             base = f"/rest/aio-tcms/1.0/project/{int(project_id)}"
-            add(f"{base}/traceability/issue/{issue_key}", {"c_pId": int(project_id), "t": int(_time.time() * 1000)})
+            now_ms = int(_time.time() * 1000)
             if issue_id:
-                add(f"{base}/traceability/issue/{issue_id}", {"c_pId": int(project_id), "t": int(_time.time() * 1000)})
-                add(f"{base}/traceability/jiraIssue/{issue_id}", {"c_pId": int(project_id), "t": int(_time.time() * 1000)})
-                add(f"{base}/traceability/jiraissue/{issue_id}", {"c_pId": int(project_id), "t": int(_time.time() * 1000)})
-                add(f"{base}/traceability/task/{issue_id}", {"c_pId": int(project_id), "t": int(_time.time() * 1000)})
-            add(f"{base}/traceability", {"issueKey": issue_key, "c_pId": int(project_id), "t": int(_time.time() * 1000)})
-            if issue_id:
-                add(f"{base}/traceability", {"issueId": issue_id, "c_pId": int(project_id), "t": int(_time.time() * 1000)})
-                add(f"{base}/traceability", {"taskId": issue_id, "c_pId": int(project_id), "t": int(_time.time() * 1000)})
+                # F12 기준 실제 TC 매핑 우선 후보
+                add("requirement", f"{base}/traceability/requirement/{issue_id}", {
+                    "showAllCaseUserVersions": "false", "c_pId": int(project_id), "t": now_ms,
+                })
+                add("associations", f"{base}/traceability/associations/{issue_id}", {
+                    "c_pId": int(project_id), "t": now_ms,
+                })
+                # 일부 AIO 버전은 issueId/taskId 명칭이 다르다.
+                add("issue_id", f"{base}/traceability/issue/{issue_id}", {"c_pId": int(project_id), "t": now_ms})
+                add("jiraIssue", f"{base}/traceability/jiraIssue/{issue_id}", {"c_pId": int(project_id), "t": now_ms})
+                add("jiraissue", f"{base}/traceability/jiraissue/{issue_id}", {"c_pId": int(project_id), "t": now_ms})
+                add("task_id", f"{base}/traceability/task/{issue_id}", {"c_pId": int(project_id), "t": now_ms})
+                add("traceability_issueId_param", f"{base}/traceability", {"issueId": issue_id, "c_pId": int(project_id), "t": now_ms})
+                add("traceability_taskId_param", f"{base}/traceability", {"taskId": issue_id, "c_pId": int(project_id), "t": now_ms})
 
-        for path, params in paths:
+            add("issue_key", f"{base}/traceability/issue/{issue_key}", {"c_pId": int(project_id), "t": now_ms})
+            add("traceability_issueKey_param", f"{base}/traceability", {"issueKey": issue_key, "c_pId": int(project_id), "t": now_ms})
+
+        payloads = []
+        for label, path, params in paths:
             try:
                 data = self.get(path, params=params)
             except Exception:
                 continue
+            # 빈 dict/list는 후보로 의미가 거의 없다. 단, 0 자체는 payload가 아니므로 제외.
             if data:
-                return data
-        return None
+                payloads.append((label, data))
+        return payloads
 
     @staticmethod
     def _iter_text_values(obj):
@@ -559,125 +690,216 @@ class JiraClient:
 
     @staticmethod
     def _extract_aio_cycle_totals_from_payload(data) -> dict[str, int]:
-        """AIO payload에서 테스트 케이스 개수 추출.
+        """AIO payload에서 실제 Test Case 개수를 추출한다.
 
-        기존 구현은 `testCycle.summary.totalTests` 또는 최상위 `testCases`만 확인했다.
-        실제 AIO 응답은 플러그인 버전/화면 호출 위치에 따라 rows/items/results/testCases 안에
-        중첩되거나, totalTests/testCaseCount 같은 필드명으로 내려올 수 있어 전체 payload를 순회한다.
-        중복 배열을 여러 번 더하지 않도록 cycle key가 없을 때는 최대값 1개만 사용한다.
+        핵심 원칙:
+        - 검증 기준은 Test Cycle 개수가 아니라 Test Case 개수다.
+        - cycle=0이어도 Test Case가 존재하면 OK/FAIL 판단에 사용해야 한다.
+        - endpoint마다 같은 TC 수가 반복될 수 있으므로 합산하지 않고 후보 중 최대값을 쓴다.
         """
         if not data:
             return {}
 
-        cycle_totals: dict[str, int] = {}
-        no_cycle_max = 0
+        tc_keys: set[str] = set()
+        tc_array_max = 0
+        explicit_tc_total_max = 0
+        cycle_total_max = 0
 
-        def put(cycle_key, total):
-            nonlocal no_cycle_max
+        def norm_key(k) -> str:
+            return re.sub(r"[^a-z0-9]", "", str(k or "").lower())
+
+        def to_int(v) -> int:
+            if isinstance(v, bool):
+                return 0
             try:
-                n = int(total)
+                n = int(v)
+                return n if n > 0 else 0
             except Exception:
-                return
-            if n <= 0:
-                return
-            if cycle_key:
-                ck = str(cycle_key)
-                prev = cycle_totals.get(ck, 0)
-                if n > prev:
-                    cycle_totals[ck] = n
-            else:
-                if n > no_cycle_max:
-                    no_cycle_max = n
+                return 0
 
-        def cycle_from_obj(obj, current_cycle=None):
-            if not isinstance(obj, dict):
-                return current_cycle
-            cycle = current_cycle
-            for key_name in ("testCycle", "testcycle", "cycle", "testRun", "testrun"):
-                tc = obj.get(key_name)
-                if isinstance(tc, dict):
-                    detail = tc.get("detail") if isinstance(tc.get("detail"), dict) else {}
-                    cycle = (
-                        detail.get("key")
-                        or detail.get("id")
-                        or tc.get("key")
-                        or tc.get("ID")
-                        or tc.get("id")
-                        or tc.get("cycleKey")
-                        or tc.get("cycleId")
-                        or cycle
-                    )
-                    summary = tc.get("summary") if isinstance(tc.get("summary"), dict) else {}
-                    for name in ("totalTests", "totalTest", "total", "count", "totalCount", "testCaseCount"):
-                        if summary.get(name) is not None:
-                            put(cycle, summary.get(name))
-                        if tc.get(name) is not None:
-                            put(cycle, tc.get(name))
-            return cycle
+        def looks_tc_key_text(text: str) -> bool:
+            return bool(re.search(r"[A-Z][A-Z0-9_]+-TC-\d+", text or ""))
 
-        def list_is_testcase_list(lst) -> bool:
+        def collect_tc_keys(obj):
+            if isinstance(obj, str):
+                for m in re.finditer(r"[A-Z][A-Z0-9_]+-TC-\d+", obj):
+                    tc_keys.add(m.group(0))
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    collect_tc_keys(str(k))
+                    collect_tc_keys(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    collect_tc_keys(v)
+
+        def is_tc_container_key(k: str) -> bool:
+            nk = norm_key(k)
+            return (
+                "testcase" in nk
+                or nk in {"tests", "cases", "associatedcases", "linkedcases", "coveredcases", "requirementscases"}
+                or nk.endswith("cases")
+            )
+
+        def is_cycle_key(k: str) -> bool:
+            nk = norm_key(k)
+            return nk in {"testcycle", "cycle", "cycles", "testrun", "testruns", "execution", "executions"}
+
+        def looks_like_tc_row(row) -> bool:
+            if isinstance(row, str):
+                return looks_tc_key_text(row)
+            if not isinstance(row, dict):
+                return False
+            if JiraClient._looks_like_aio_testcase_row(row):
+                return True
+            keys = {norm_key(k) for k in row.keys()}
+            joined = " ".join(JiraClient._iter_text_values(row))
+            if looks_tc_key_text(joined):
+                return True
+            # AIO 응답에서 title 없이 id/key/version만 내려오는 경우 방어
+            has_id = bool(keys & {"id", "key", "testcaseid", "testcasekey", "tcid", "caseid"})
+            has_case_marker = any("testcase" in k for k in keys) or bool(keys & {"objective", "precondition", "testdata", "steps", "script"})
+            return has_id and has_case_marker
+
+        def count_tc_list(lst) -> int:
             if not isinstance(lst, list) or not lst:
-                return False
-            checked = [x for x in lst[:30] if isinstance(x, dict)]
-            if not checked:
-                return False
-            hits = sum(1 for x in checked if JiraClient._looks_like_aio_testcase_row(x))
-            return hits > 0
+                return 0
+            # 문자열 TC 키 배열
+            str_hits = sum(1 for x in lst if isinstance(x, str) and looks_tc_key_text(x))
+            if str_hits > 0:
+                return str_hits
+            dict_items = [x for x in lst if isinstance(x, dict)]
+            if not dict_items:
+                return 0
+            sample = dict_items[:50]
+            hits = sum(1 for x in sample if looks_like_tc_row(x))
+            # parent key가 testcase 계열이 아니어도 내용상 TC row면 채택
+            if hits >= max(1, (len(sample) + 1) // 2):
+                return len(dict_items)
+            return 0
 
-        def walk(obj, current_cycle=None):
+        def extract_total_from_tc_dict(d: dict) -> int:
+            """testCases: {total: 6, values:[...]} 같은 구조 처리."""
+            if not isinstance(d, dict):
+                return 0
+            best = 0
+            for name in ("total", "count", "totalCount", "size", "length", "numberOfElements", "totalElements",
+                         "totalTests", "testCaseCount", "totalTestCases", "testCasesCount"):
+                best = max(best, to_int(d.get(name)))
+            for name in ("items", "values", "results", "data", "rows", "content", "list", "testCases", "cases"):
+                v = d.get(name)
+                if isinstance(v, list):
+                    best = max(best, len(v) if v else 0, count_tc_list(v))
+            return best
+
+        def walk(obj, parent_key: str = "", in_cycle: bool = False):
+            nonlocal tc_array_max, explicit_tc_total_max, cycle_total_max
+
             if isinstance(obj, list):
-                if list_is_testcase_list(obj):
-                    put(current_cycle, len(obj))
+                if is_tc_container_key(parent_key):
+                    # testCases: [...] 는 내용 판별이 약해도 TC 목록으로 본다.
+                    tc_array_max = max(tc_array_max, len([x for x in obj if x is not None]))
+                tc_array_max = max(tc_array_max, count_tc_list(obj))
                 for item in obj:
-                    walk(item, current_cycle)
+                    walk(item, parent_key, in_cycle or is_cycle_key(parent_key))
                 return
 
             if not isinstance(obj, dict):
                 return
 
-            cycle = cycle_from_obj(obj, current_cycle)
+            parent_is_tc = is_tc_container_key(parent_key)
+            parent_is_cycle = in_cycle or is_cycle_key(parent_key)
 
-            # 현재 dict의 직접 total/count 필드. key 이름에 testcase/test/total 계열이 있을 때만 후보로 본다.
+            # dict 자체가 testCases 컨테이너일 때 total/results 처리
+            if parent_is_tc:
+                explicit_tc_total_max = max(explicit_tc_total_max, extract_total_from_tc_dict(obj))
+
             for k, v in obj.items():
-                kl = str(k).lower()
-                if kl in ("totaltests", "totaltest", "testcasecount", "testcasescount", "totalcases", "totaltestcases"):
-                    put(cycle, v)
-                elif isinstance(v, dict) and kl in ("summary", "progress", "statistics", "stat"):
-                    for name in ("totalTests", "totalTest", "testCaseCount", "totalTestCases"):
-                        if v.get(name) is not None:
-                            put(cycle, v.get(name))
-                elif isinstance(v, list) and kl in ("testcases", "testcase", "tests", "test_case_list", "items", "rows", "results", "data"):
-                    if list_is_testcase_list(v):
-                        put(cycle, len(v))
+                nk = norm_key(k)
+                key_is_tc = is_tc_container_key(k)
+                key_is_cycle = is_cycle_key(k)
 
-            for v in obj.values():
-                walk(v, cycle)
+                # testCases/testCaseCount 계열은 cycle 여부와 무관하게 TC 후보다.
+                if key_is_tc:
+                    if isinstance(v, list):
+                        tc_array_max = max(tc_array_max, len([x for x in v if x is not None]), count_tc_list(v))
+                    elif isinstance(v, dict):
+                        explicit_tc_total_max = max(explicit_tc_total_max, extract_total_from_tc_dict(v))
+                    else:
+                        explicit_tc_total_max = max(explicit_tc_total_max, to_int(v))
 
+                # 명시적 TC 카운터만 TC 총계로 사용한다.
+                if nk in {"testcasecount", "testcasescount", "totaltestcases", "totaltestcase", "casecount", "totalcases"}:
+                    explicit_tc_total_max = max(explicit_tc_total_max, to_int(v))
+
+                # progress.total / summary.total 은 testCases 컨테이너 내부일 때만 TC 총계로 본다.
+                if parent_is_tc and nk in {"total", "count", "totalcount", "totaltests", "size", "length", "totalelements"}:
+                    explicit_tc_total_max = max(explicit_tc_total_max, to_int(v))
+
+                # cycle/testRun 내부 totalTests는 fallback 전용이다.
+                if parent_is_cycle and nk in {"totaltests", "totaltest", "total", "count", "totalcount", "testcasecount"}:
+                    cycle_total_max = max(cycle_total_max, to_int(v))
+
+                if isinstance(v, dict):
+                    # progress/summary/statistics가 testCases 컨테이너 안에 있을 수 있음
+                    child_parent = k
+                    walk(v, child_parent, parent_is_cycle or key_is_cycle)
+                elif isinstance(v, list):
+                    walk(v, k, parent_is_cycle or key_is_cycle)
+
+        collect_tc_keys(data)
         walk(data)
-        # cycle별 total이 잡힌 경우에는 cycle 정보 없는 중첩 배열은 중복 후보로 보고 더하지 않는다.
-        if no_cycle_max > 0 and not cycle_totals:
-            cycle_totals["no_cycle"] = no_cycle_max
-        return cycle_totals
+
+        candidates = {
+            "tc_keys": len(tc_keys),
+            "tc_array": tc_array_max,
+            "explicit_total": explicit_tc_total_max,
+            "cycle_total": cycle_total_max,
+        }
+        # 양수인 후보를 모두 반환한다.
+        # 상위 _get_aio_actual_count 가 add_count()로 최대값을 채택하므로
+        # 여기서 best 1개만 내보낼 필요가 없다.
+        result = {label: int(val) for label, val in candidates.items() if int(val or 0) > 0}
+        if not result:
+            return {}
+        return result
 
     def _get_aio_actual_count(self, issue_key: str, issue_id: str | None = None, project_id: int | None = None) -> tuple[int | None, dict[str, int]]:
         """AIO 테스트 케이스 실제 개수 조회.
 
-        반환: (actual_count, 상세 cycle_totals)
+        endpoint별 결과를 합산하지 않고 최대값을 채택한다.
+        동일 TC가 requirement/associations/html에 반복 노출될 수 있기 때문이다.
         """
-        cycle_totals: dict[str, int] = {}
-        issue_payload = None
+        counts: dict[str, int] = {}
+        best = 0
+
+        def add_count(label: str, value: int):
+            nonlocal best
+            try:
+                n = int(value)
+            except Exception:
+                return
+            if n <= 0:
+                return
+            counts[label] = max(counts.get(label, 0), n)
+            if n > best:
+                best = n
 
         if project_id is not None:
             try:
-                issue_payload = self._get_aio_traceability_issue_json_candidates(issue_key, issue_id, project_id)
+                payloads = self._get_aio_traceability_issue_json_candidates(issue_key, issue_id, project_id)
             except Exception:
-                issue_payload = None
-        if issue_payload:
-            for k, v in self._extract_aio_cycle_totals_from_payload(issue_payload).items():
-                cycle_totals[k] = max(cycle_totals.get(k, 0), int(v))
+                payloads = []
+            for label, payload in payloads:
+                extracted = self._extract_aio_cycle_totals_from_payload(payload)
+                for k, v in extracted.items():
+                    add_count(f"api:{label}:{k}", v)
 
+        # API에서 못 잡거나 required보다 낮으면 browse HTML fallback도 시도한다.
+        # best <= 0: API에서 아무것도 못 잡은 경우
+        # best < min_required: API가 뭔가를 잡았지만 약한 값(cycle_total 등)일 수 있으므로 재확인
+        min_required = min(self.DIFFICULTY_MIN_CASES.values())  # 최솟값 = D난이도 기준 (2)
         html = ""
-        if not cycle_totals:
+        if best < min_required:
             try:
                 html = self.get_text(f"/browse/{issue_key}")
             except Exception:
@@ -685,21 +907,20 @@ class JiraClient:
 
             html_count = self._extract_aio_count_from_html(html)
             if html_count:
-                cycle_totals["html"] = int(html_count)
+                add_count("html", html_count)
 
-            if not cycle_totals:
-                refs = self._extract_aio_task_refs_from_html(html)
-                for project_id2, task_id in refs:
-                    try:
-                        payload = self._get_aio_traceability_task_json(project_id2, task_id)
-                    except Exception:
-                        continue
-                    for k, v in self._extract_aio_cycle_totals_from_payload(payload).items():
-                        cycle_totals[k] = max(cycle_totals.get(k, 0), int(v))
+            refs = self._extract_aio_task_refs_from_html(html)
+            for project_id2, task_id in refs:
+                try:
+                    payload = self._get_aio_traceability_task_json(project_id2, task_id)
+                except Exception:
+                    continue
+                for k, v in self._extract_aio_cycle_totals_from_payload(payload).items():
+                    add_count(f"task:{task_id}:{k}", v)
 
-        if not cycle_totals:
+        if best <= 0:
             return None, {}
-        return int(sum(cycle_totals.values())), cycle_totals
+        return int(best), counts
 
     def get_aio_test_validation(self, issue_key: str) -> dict:
         issue_id = ""
@@ -1555,86 +1776,187 @@ class JiraClient:
 
         return {"missing": missing, "sw_voc_ok": sw_voc_ok}
 
-    def get_pr_merge_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
-        """병합된 PR이 1개 이상인지 확인.
+    @staticmethod
+    def _extract_pull_requests_from_devstatus_payload(data) -> list[dict]:
+        """dev-status detail/summary 변형에서 pull request 객체를 재귀적으로 수집한다."""
+        out: list[dict] = []
+        seen = set()
 
-        Jira dev-status API를 통해 stash(Bitbucket) 또는 GitHub PR 중
-        status가 MERGED인 것이 있으면 True.
-        """
-        try:
-            # 이슈 ID(숫자)
-            if not issue_id:
-                issue_data = self.get(f"/rest/api/2/issue/{issue_key}", params={"fields": "id"})
-                issue_id = issue_data.get("id", "")
-            if not issue_id:
+        def looks_like_pr(d: dict) -> bool:
+            if not isinstance(d, dict):
                 return False
+            keys = {str(k).lower() for k in d.keys()}
+            # pullRequests 컨테이너 자체는 PR 객체가 아니다
+            if "pullrequest" in " ".join(keys) or "pullrequests" in " ".join(keys):
+                return False
+            # PR로 인정하려면 상태 필드 + PR임을 확인할 수 있는 단서가 함께 있어야 한다.
+            has_status = bool(keys & {"status", "state", "merged", "ismerged"})
+            has_pr_url = "pull" in str(d.get("url") or "").lower() or "pull" in str(d.get("href") or "").lower()
+            has_pr_type = "pull" in str(d.get("type") or "").lower()
+            # pullRequestId / pullrequest 관련 키가 있으면 명확한 PR
+            has_pr_key = bool(keys & {"pullrequestid", "prid", "pr_id", "pullrequest_id"})
+            # 브랜치/커밋 dict는 PR이 아님: branch/commit/ref 전용 키만 있는 경우 제외
+            only_branch_keys = keys <= {"name", "url", "href", "id", "type", "state", "status",
+                                        "createdate", "updatedate", "lastupdated", "branch",
+                                        "repository", "ref", "refname", "displayid"}
+            if only_branch_keys and not has_pr_url and not has_pr_type and not has_pr_key:
+                return False
+            return has_status and (has_pr_url or has_pr_type or has_pr_key)
 
-            for app_type in ("stash", "github", "bitbucket"):
+        def add_pr(pr):
+            if not isinstance(pr, dict):
+                return
+            pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or id(pr)
+            key = str(pid)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(pr)
+
+        def walk(obj, parent_key: str = ""):
+            if isinstance(obj, list):
+                if str(parent_key).lower() in {"pullrequests", "pullrequest", "prs", "pullrequestdata"}:
+                    for item in obj:
+                        add_pr(item)
+                for item in obj:
+                    walk(item, parent_key)
+                return
+            if not isinstance(obj, dict):
+                return
+
+            for k, v in obj.items():
+                kl = str(k).lower()
+                if kl in {"pullrequests", "pullrequest", "prs", "pullrequestdata",
+                          "mergerequests", "mergerequest", "mrs"}:
+                    if isinstance(v, list):
+                        for item in v:
+                            add_pr(item)
+                    elif isinstance(v, dict):
+                        # 단일 PR 객체 또는 values/items 내부 배열
+                        if looks_like_pr(v):
+                            add_pr(v)
+                        for child_key in ("values", "items", "data", "results", "content"):
+                            child = v.get(child_key)
+                            if isinstance(child, list):
+                                for item in child:
+                                    add_pr(item)
+                elif isinstance(v, dict) and looks_like_pr(v) and kl in {"pullrequest", "pr",
+                                                                           "mergerequest", "mr"}:
+                    add_pr(v)
+                walk(v, k)
+
+        walk(data)
+        return out
+
+    @staticmethod
+    def _normalize_pr_status(pr: dict) -> str:
+        if not isinstance(pr, dict):
+            return "UNKNOWN"
+        if pr.get("merged") is True or pr.get("isMerged") is True:
+            return "MERGED"
+        raw = pr.get("status")
+        if isinstance(raw, dict):
+            raw = raw.get("state") or raw.get("status") or raw.get("name") or raw.get("value") or ""
+        if not raw:
+            raw = pr.get("state") or pr.get("reviewStatus") or pr.get("mergeStatus") or ""
+        s = str(raw or "").upper()
+        if "MERGED" in s or s == "MERGE":
+            return "MERGED"
+        if "OPEN" in s:
+            return "OPEN"
+        if "DECLINED" in s or "DECLINE" in s:
+            return "DECLINED"
+        if "CLOSED" in s or "CLOSE" in s:
+            return "CLOSED"
+        if "UNKNOWN" in s:
+            return "UNKNOWN"
+        return s or "UNKNOWN"
+
+    def _get_devstatus_app_types(self, issue_id: str) -> tuple[list[str], int, bool]:
+        """dev-status summary에서 PR applicationType 후보와 overall count를 얻는다."""
+        app_types: list[str] = []
+        overall_count = 0
+        had_error = False
+
+        def add_app_type(v):
+            """원본 그대로 + 소문자 변형도 추가 (Jira는 applicationType 대소문자 구분)"""
+            if not v:
+                return
+            s = str(v).strip()
+            if not s:
+                return
+            existing_lower = [x.lower() for x in app_types]
+            if s not in app_types:
+                app_types.append(s)
+            if s.lower() not in app_types and s.lower() not in existing_lower:
+                app_types.append(s.lower())
+
+        try:
+            summary = self.get(
+                "/rest/dev-status/latest/issue/summary",
+                params={"issueId": issue_id},
+            ) or {}
+            sm = summary.get("summary") if isinstance(summary.get("summary"), dict) else {}
+            pr_sum = sm.get("pullrequest") if isinstance(sm.get("pullrequest"), dict) else {}
+            overall = pr_sum.get("overall") if isinstance(pr_sum.get("overall"), dict) else {}
+            try:
+                overall_count = int(overall.get("count") or 0)
+            except Exception:
+                overall_count = 0
+
+            by_inst = pr_sum.get("byInstanceType") if isinstance(pr_sum.get("byInstanceType"), dict) else {}
+            for inst_key, inst_val in by_inst.items():
+                cnt = 0
                 try:
-                    data = self.get(
-                        "/rest/dev-status/latest/issue/detail",
-                        params={
-                            "issueId": issue_id,
-                            "applicationType": app_type,
-                            "dataType": "pullrequest",
-                        }
-                    )
-                    for detail in (data.get("detail") or []):
-                        for pr in (detail.get("pullRequests") or []):
-                            if (pr.get("status") or "").upper() == "MERGED":
-                                return True
+                    cnt = int((inst_val or {}).get("count") or 0)
                 except Exception:
-                    any_error = True
-                    continue
-            return False
+                    cnt = 0
+                if cnt > 0:
+                    add_app_type(inst_key)
+                    if isinstance(inst_val, dict):
+                        add_app_type(inst_val.get("applicationType"))
+                        add_app_type(inst_val.get("type"))
+                        add_app_type(inst_val.get("name"))
         except Exception:
-            return False
+            had_error = True
+
+        # 사내 Bitbucket Server 계열까지 기본 후보에 포함
+        for at in ("bitbucketserver", "stash", "bitbucket", "github", "gitlab", "fecru"):
+            add_app_type(at)
+        return app_types, overall_count, had_error
+
+    def get_pr_merge_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
+        """병합된 PR이 1개 이상인지 확인."""
+        status = self.get_pr_merge_status(issue_key, issue_id)
+        return "MERGED" in str(status or "").upper()
 
     def get_pr_merge_status(self, issue_key: str, issue_id: str | None = None) -> str:
         """PR 상태 요약 문자열을 반환한다.
 
-        - dev-status API에서 pullRequests를 조회
-        - 상태를 MERGED/OPEN/DECLINED/CLOSED 등으로 정규화
-        - 여러 PR이 있으면 상태별 건수로 요약 (예: 'MERGED(1),OPEN(2)')
-        - PR이 하나도 없으면 'NONE'
-        - 조회/파싱 예외는 'ERR'
+        dev-status detail 응답 내부 pullRequests 위치가 repository/branch/detail 하위로 달라질 수 있어
+        재귀적으로 PR 객체를 수집한다.
         """
         try:
             if not issue_id:
-                issue_data = self.get(f"/rest/api/2/issue/{issue_key}", params={"fields": "id"})
-                issue_id = issue_data.get("id", "")
+                try:
+                    issue_data = self.get(f"/rest/api/2/issue/{issue_key}", params={"fields": "id"})
+                    issue_id = issue_data.get("id", "")
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code in (401, 403):
+                        return "N/A(권한없음)"
+                    raise
             if not issue_id:
                 return "ERR"
 
+            app_types_to_try, summary_pr_overall, summary_error = self._get_devstatus_app_types(str(issue_id))
             counts: dict[str, int] = {}
             total_pr = 0
             any_success = False
-            any_error = False
+            any_no_permission = False
+            any_error = bool(summary_error)
+            seen_pr = set()
 
-            def _norm_status(pr: dict) -> str:
-                # 여러 스키마 호환
-                raw = pr.get("status")
-                if isinstance(raw, dict):
-                    raw = raw.get("state") or raw.get("status") or raw.get("name") or ""
-                if not raw:
-                    raw = pr.get("state") or pr.get("status") or ""
-                s = str(raw).upper()
-
-                # merged 플래그 보정
-                if pr.get("merged") is True or pr.get("isMerged") is True:
-                    return "MERGED"
-
-                if "MERGED" in s:
-                    return "MERGED"
-                if "OPEN" in s:
-                    return "OPEN"
-                if "DECLINED" in s or "DECLINE" in s:
-                    return "DECLINED"
-                if "CLOSED" in s or "CLOSE" in s:
-                    return "CLOSED"
-                return s or "UNKNOWN"
-
-            for app_type in ("stash", "github", "bitbucket"):
+            for app_type in app_types_to_try:
                 try:
                     data = self.get(
                         "/rest/dev-status/latest/issue/detail",
@@ -1642,25 +1964,43 @@ class JiraClient:
                             "issueId": issue_id,
                             "applicationType": app_type,
                             "dataType": "pullrequest",
-                        }
-                    )
+                        },
+                    ) or {}
                     any_success = True
-                    for detail in (data.get("detail") or []):
-                        for pr in (detail.get("pullRequests") or []):
-                            total_pr += 1
-                            st = _norm_status(pr or {})
-                            counts[st] = counts.get(st, 0) + 1
+                    prs = self._extract_pull_requests_from_devstatus_payload(data)
+                    for pr in prs:
+                        pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or str(pr)
+                        pid = str(pid)
+                        if pid in seen_pr:
+                            continue
+                        seen_pr.add(pid)
+                        total_pr += 1
+                        st = self._normalize_pr_status(pr)
+                        counts[st] = counts.get(st, 0) + 1
+                except requests.HTTPError as e:
+                    if e.response is not None and e.response.status_code in (401, 403):
+                        any_no_permission = True
+                    else:
+                        any_error = True
+                    continue
                 except Exception:
                     any_error = True
                     continue
 
+            # 권한 없음: 성공한 호출이 없고 403/401만 받은 경우
+            if any_no_permission and not any_success and total_pr == 0:
+                return "N/A(권한없음)"
+
+            if total_pr == 0 and summary_pr_overall > 0:
+                # summary상 PR은 있는데 detail 구조/권한/instance 문제로 상태를 못 읽은 경우.
+                counts["UNKNOWN"] = summary_pr_overall
+                total_pr = summary_pr_overall
+
             if total_pr == 0:
-                # dev-status 조회가 전부 실패한 경우(None으로 오판정 방지)
                 if (not any_success) and any_error:
                     return "ERR"
                 return "NONE"
 
-            # 보기 좋게: MERGED, OPEN, DECLINED, CLOSED, UNKNOWN, 기타 순
             order = ["MERGED", "OPEN", "DECLINED", "CLOSED", "UNKNOWN"]
             parts = []
             for k in order:
@@ -1698,7 +2038,7 @@ class JiraClient:
         issuelinks = fields.get("issuelinks") or []
         issue_id = core.get("id") or ""
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = {}
 
             futures["body_len"] = executor.submit(self.get_body_length_string_from_ui, issue_key)
@@ -1708,9 +2048,12 @@ class JiraClient:
             futures["tc"] = executor.submit(self.get_tc_generation_check, issue_key)
             futures["pr_merge"] = executor.submit(self.get_pr_merge_ok, issue_key, issue_id)
 
+            # AIO/PR은 여러 endpoint를 순회하므로 timeout을 넉넉하게 준다.
+            SLOW_KEYS = {"tc", "pr_merge"}
             for key, future in futures.items():
+                t = 45 if key in SLOW_KEYS else 15
                 try:
-                    result = future.result(timeout=10)
+                    result = future.result(timeout=t)
                     if key == "body_len":
                         results["body_len"] = result
                     elif key == "err_table":
@@ -1733,7 +2076,7 @@ class JiraClient:
         """SCCB 대상 검증에서 공통으로 쓰는 필드(id/description/issuelinks)를 1회에 가져온다."""
         return self.get(
             f"/rest/api/2/issue/{issue_key}",
-            params={"fields": "description,issuelinks"}
+            params={"fields": "id,description,issuelinks"}
         )
 
     def get_issues_core_batch(self, issue_keys: list[str]) -> dict[str, dict]:
@@ -1751,7 +2094,7 @@ class JiraClient:
                 "/rest/api/2/search",
                 params={
                     "jql": jql,
-                    "fields": "description,issuelinks",
+                    "fields": "id,description,issuelinks",
                     "maxResults": len(issue_keys)
                 }
             )
@@ -1861,6 +2204,1079 @@ class JiraClient:
         if not r.ok:
             raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {url}\n{r.text}", response=r)
         return r.json()
+
+    def _post_json_absolute(self, url: str, json_body: dict):
+        r = self._session().post(
+            url,
+            json=json_body,
+            timeout=self.timeout,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        if not r.ok:
+            raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {url}\n{r.text}", response=r)
+        return r.json() if r.text else None
+
+    def _put_json_absolute(self, url: str, json_body: dict):
+        r = self._session().put(
+            url,
+            json=json_body,
+            timeout=self.timeout,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        if not r.ok:
+            raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {url}\n{r.text}", response=r)
+        return r.json() if r.text else None
+
+    def _get_html_absolute(self, url: str, params=None):
+        r = self._session().get(
+            url,
+            params=params,
+            timeout=self.timeout,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+        )
+        if not r.ok:
+            raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {url}\n{r.text}", response=r)
+        return r
+
+    def _post_form_absolute(self, url: str, form_fields, referer: str = ""):
+        headers = {
+            "Accept": "text/html,application/xhtml+xml",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        if referer:
+            headers["Referer"] = referer
+        r = self._session().post(
+            url,
+            data=form_fields,
+            timeout=self.timeout,
+            headers=headers,
+            allow_redirects=True,
+        )
+        if not r.ok:
+            raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {url}\n{r.text}", response=r)
+        return r
+
+    @staticmethod
+    def _replace_form_field(fields, name: str, value: str):
+        """HTML form의 특정 필드는 기존 값을 제거한 뒤 지정 값 하나만 넣는다."""
+        target = (name or "").strip()
+        if not target:
+            return list(fields or [])
+        result = [(k, v) for k, v in (fields or []) if k != target]
+        result.append((target, value))
+        return result
+
+    @staticmethod
+    def _parse_weekly_confluence_title(title: str, reference_date=None) -> dict:
+        """
+        주간 SCCB 제목의 주차/날짜 범위를 해석한다.
+
+        예) ``26W (06/22~06/29)``
+        - 연도는 제목에 없으므로, 기준일과 가장 가까운 실제 날짜 범위를 선택한다.
+        - 이 방식으로 12월~1월 경계에서 다음 해 1월 페이지를 만들 때도 연도를 올바르게 처리한다.
+        """
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+
+        src = (title or "").strip()
+        pat = re.compile(
+            r"(?P<week>\d{1,2})W\s*\(\s*"
+            r"(?P<sm>\d{1,2})/(?P<sd>\d{1,2})\s*~\s*"
+            r"(?P<em>\d{1,2})/(?P<ed>\d{1,2})\s*\)"
+        )
+        m = pat.search(src)
+        if not m:
+            raise ValueError(f"페이지 제목에서 주차 패턴을 찾지 못했습니다: {title}")
+
+        week = int(m.group("week"))
+        sm = int(m.group("sm"))
+        sd = int(m.group("sd"))
+        em = int(m.group("em"))
+        ed = int(m.group("ed"))
+        today = reference_date or datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+        # 제목에는 연도가 없으므로, 전년/당년/다음년 후보를 비교한다.
+        # 우선순위는 제목의 W 번호와 실제 ISO 주차가 일치하고 시작일이 월요일인 후보이다.
+        # 이 기준이 있어야 53W (12/28~01/03)처럼 연말 제목을 몇 달 전에 미리
+        # 생성해도 직전 연도로 오인하지 않는다. 그 다음으로 오늘과의 거리를 사용한다.
+        candidates = []
+        for start_year in (today.year - 1, today.year, today.year + 1):
+            try:
+                start = date(start_year, sm, sd)
+                end_year = start_year + 1 if (em, ed) < (sm, sd) else start_year
+                end = date(end_year, em, ed)
+            except ValueError:
+                continue
+            if today < start:
+                distance = (start - today).days
+            elif today > end:
+                distance = (today - end).days
+            else:
+                distance = 0
+
+            iso_week_matches = start.isocalendar().week == week
+            starts_on_monday = start.isoweekday() == 1
+            candidate_priority = 0 if (iso_week_matches and starts_on_monday) else 1
+            candidates.append((candidate_priority, distance, start, end))
+
+        if not candidates:
+            raise ValueError(f"페이지 제목의 날짜가 올바르지 않습니다: {title}")
+
+        _, _, start, end = min(candidates, key=lambda item: (item[0], item[1]))
+        return {
+            "match": m,
+            "week": week,
+            "start": start,
+            "end": end,
+        }
+
+    @classmethod
+    def _make_next_week_title(cls, title: str, reference_date=None) -> tuple[str, dict]:
+        """
+        예) 25W (06/15~06/21) -> 26W (06/22~06/28)
+
+        SCCB 주간 페이지 기간은 **월요일~일요일(7일)** 기준이다.
+        원본 제목의 종료일이 과거 관행처럼 다음 주 월요일로 적혀 있더라도,
+        새로 생성하는 제목/본문 기간은 다음 시작일 기준의 일요일로 정규화한다.
+
+        다음 주차는 단순 ``+1`` 대신 다음 시작일의 ISO 주차를 사용한다.
+        따라서 연말에는 52W/53W에서 1W로 자연스럽게 전환된다.
+        """
+        from datetime import timedelta
+
+        src = title or ""
+        info = cls._parse_weekly_confluence_title(src, reference_date=reference_date)
+        old_start = info["start"]
+        next_start = old_start + timedelta(days=7)
+        # SCCB 페이지는 월~일 범위로 표시한다. (다음 월요일이 아님)
+        next_end = next_start + timedelta(days=6)
+        next_week = next_start.isocalendar().week
+        replacement = (
+            f"{next_week}W ({next_start.month:02d}/{next_start.day:02d}"
+            f"~{next_end.month:02d}/{next_end.day:02d})"
+        )
+        m = info["match"]
+        return src[:m.start()] + replacement + src[m.end():], {
+            **info,
+            "next_start": next_start,
+            "next_end": next_end,
+            "next_week": next_week,
+        }
+
+    @staticmethod
+    def _replace_weekly_date_ranges_in_body(
+        body: str,
+        old_title: str,
+        new_title: str,
+        old_start,
+        old_end,
+        new_start,
+        new_end,
+    ) -> str:
+        """주간 페이지 머리말에 있는 날짜 범위를 다음 주 범위로 갱신한다.
+
+        실제 Confluence 본문에서 자주 쓰는 날짜 표기 3가지를 지원한다.
+        - ``2026. 6. 22. ~ 2026. 6. 29.``
+        - ``2026-06-22 ~ 2026-06-29``
+        - ``06/22~06/29`` 또는 ``6/22 ~ 6/29``
+
+        원본 주간 범위와 정확히 일치하는 구간만 바꾸므로, 이슈 생성일/희망일 같은
+        표 내부의 다른 날짜를 넓게 치환하지 않는다.
+        """
+        text = body or ""
+        if old_title and new_title:
+            text = text.replace(old_title, new_title)
+
+        old_dot = (
+            rf"{old_start.year}\s*\.\s*0?{old_start.month}\s*\.\s*0?{old_start.day}\s*\.?"
+            rf"\s*~\s*"
+            rf"{old_end.year}\s*\.\s*0?{old_end.month}\s*\.\s*0?{old_end.day}\s*\.?"
+        )
+        new_dot = (
+            f"{new_start.year}. {new_start.month}. {new_start.day}. "
+            f"~ {new_end.year}. {new_end.month}. {new_end.day}."
+        )
+        text = re.sub(old_dot, new_dot, text)
+
+        old_dash = (
+            rf"{old_start.year}-0?{old_start.month}-0?{old_start.day}"
+            rf"\s*~\s*"
+            rf"{old_end.year}-0?{old_end.month}-0?{old_end.day}"
+        )
+        new_dash = f"{new_start:%Y-%m-%d} ~ {new_end:%Y-%m-%d}"
+        text = re.sub(old_dash, new_dash, text)
+
+        old_slash = (
+            rf"(?<!\d)0?{old_start.month}\s*/\s*0?{old_start.day}"
+            rf"\s*~\s*"
+            rf"0?{old_end.month}\s*/\s*0?{old_end.day}(?!\d)"
+        )
+        new_slash = f"{new_start:%m/%d}~{new_end:%m/%d}"
+        text = re.sub(old_slash, new_slash, text)
+
+        # SCCB 본문 하단의 ``사전SCCB 검토 의견`` 제목에는 Stiltsoft Handy
+        # Date 매크로 2개가 나란히 배치되어 있다. 화면에서는 아래처럼 렌더링된다.
+        #
+        #   <time datetime="2026-06-22" class="... handy-date-time">
+        #       <span class="handy-date-value">2026. 6. 22.</span>
+        #   </time>
+        #
+        # 날짜가 하나씩 독립된 인라인 매크로라서 위의 ``범위`` 치환만으로는
+        # 바뀌지 않는다. 이 부분은 Handy Date 요소/매크로 내부에서만 날짜를
+        # 바꿔, 다른 표의 개별 이슈 일정은 건드리지 않는다.
+        #
+        # 주간 이동에서는 보통 ``새 시작일 == 기존 종료일``이므로, 날짜를 순차
+        # 치환하면 시작일이 두 번 바뀌는 문제가 생긴다. 따라서 두 날짜를 하나의
+        # 정규식/콜백으로 매핑한다.
+        date_pairs = (
+            (old_start, new_start),
+            (old_end, new_end),
+        )
+        iso_replacements = {
+            old_date.strftime("%Y-%m-%d"): new_date.strftime("%Y-%m-%d")
+            for old_date, new_date in date_pairs
+        }
+        display_patterns = [
+            (
+                rf"{old_date.year}\s*\.\s*0?{old_date.month}\s*\.\s*"
+                rf"0?{old_date.day}\s*\.?",
+                f"{new_date.year}. {new_date.month}. {new_date.day}.",
+            )
+            for old_date, new_date in date_pairs
+        ]
+        display_pattern = re.compile(
+            "|".join(f"(?P<d{i}>{pattern})" for i, (pattern, _) in enumerate(display_patterns))
+        )
+
+        def replace_display_date(match):
+            for index, (_, new_display) in enumerate(display_patterns):
+                if match.group(f"d{index}") is not None:
+                    return new_display
+            return match.group(0)
+
+        iso_pattern = re.compile(
+            "|".join(re.escape(old_iso) for old_iso in iso_replacements),
+            re.IGNORECASE,
+        )
+
+        def replace_iso_date(match):
+            return iso_replacements.get(match.group(0), match.group(0))
+
+        # Confluence 화면 HTML 형태. ``handy-date-time`` class가 있는
+        # time 태그만 대상으로 하므로, 일반 본문의 같은 날짜는 바꾸지 않는다.
+        time_pattern = re.compile(
+            r"<time\b(?=[^>]*\bclass\s*=\s*['\"][^'\"]*\bhandy-date-time\b[^'\"]*['\"])"
+            r"(?P<attrs>[^>]*)>(?P<body>.*?)</time>",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        datetime_pattern = re.compile(
+            r"(?P<prefix>\bdatetime\s*=\s*['\"])(?P<date>\d{4}-\d{2}-\d{2})(?P<suffix>['\"])",
+            re.IGNORECASE,
+        )
+
+        def replace_handy_time(match):
+            def replace_datetime(match_datetime):
+                old_iso = match_datetime.group("date")
+                return (
+                    f"{match_datetime.group('prefix')}"
+                    f"{iso_replacements.get(old_iso, old_iso)}"
+                    f"{match_datetime.group('suffix')}"
+                )
+
+            attrs = datetime_pattern.sub(replace_datetime, match.group("attrs"))
+            body_text = display_pattern.sub(replace_display_date, match.group("body"))
+            return f"<time{attrs}>{body_text}</time>"
+
+        text = time_pattern.sub(replace_handy_time, text)
+
+        # Storage XML 형태도 함께 처리한다. 실제 저장 포맷은 Confluence/플러그인
+        # 버전에 따라 다를 수 있으므로, ac:name에 date가 들어간 매크로 내부에서만
+        # ISO 날짜와 표시 날짜를 갱신한다.
+        date_macro_pattern = re.compile(
+            r"<ac:structured-macro\b(?=[^>]*\bac:name\s*=\s*['\"][^'\"]*date[^'\"]*['\"])"
+            r"[^>]*>.*?</ac:structured-macro>",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        def replace_handy_storage_macro(match):
+            macro = iso_pattern.sub(replace_iso_date, match.group(0))
+            return display_pattern.sub(replace_display_date, macro)
+
+        text = date_macro_pattern.sub(replace_handy_storage_macro, text)
+
+        return text
+
+    @staticmethod
+    def _get_page_parent_id(page: dict) -> str:
+        ancestors = (page or {}).get("ancestors") or []
+        if not ancestors:
+            return ""
+        return str((ancestors[-1] or {}).get("id") or "").strip()
+
+    @staticmethod
+    def _get_page_grandparent_id(page: dict) -> str:
+        """페이지의 부모가 놓인 상위 레벨 ID를 반환한다.
+
+        주간 페이지의 직접 부모는 ``26년 사전 SCCB 기록`` 같은 연도별
+        기록 페이지이고, 이 값은 해당 연도별 기록 페이지를 새로 만들 위치다.
+        직접 부모가 Space 최상위에 있으면 빈 문자열을 반환한다.
+        """
+        ancestors = (page or {}).get("ancestors") or []
+        if len(ancestors) < 2:
+            return ""
+        return str((ancestors[-2] or {}).get("id") or "").strip()
+
+    @staticmethod
+    def _make_yearly_sccb_parent_title(year: int) -> str:
+        """예: 2027 -> ``27년 사전 SCCB 기록``"""
+        return f"{int(year) % 100:02d}년 사전 SCCB 기록"
+
+    def _find_existing_confluence_sibling_page(
+        self,
+        conf_base: str,
+        space_key: str,
+        title: str,
+        parent_id: str,
+    ) -> dict | None:
+        """동일 Space 안에서 같은 부모를 가진 동일 제목 페이지가 있는지 확인한다."""
+        existing = self._get_json_absolute(
+            f"{conf_base}/rest/api/content",
+            params={
+                "spaceKey": space_key,
+                "title": title,
+                "type": "page",
+                "expand": "_links,ancestors",
+            },
+        ) or {}
+        for page in existing.get("results") or []:
+            if self._get_page_parent_id(page) == parent_id:
+                return page
+        return None
+
+    @staticmethod
+    def _confluence_page_url(conf_base: str, page: dict) -> str:
+        """Confluence content 응답의 webui 경로를 절대 URL로 변환한다."""
+        webui = ((page or {}).get("_links") or {}).get("webui") or ""
+        return f"{conf_base}{webui}" if webui else ""
+
+    def _copy_confluence_single_page(
+        self,
+        conf_base: str,
+        source_page_id: str,
+        target_parent_id: str,
+        target_parent_title: str,
+        space_key: str,
+        new_title: str,
+    ) -> dict:
+        """Confluence Server/DC의 기본 ``페이지 복사`` 화면을 통해 원본을 복제한다.
+
+        사내 Confluence처럼 Server/Data Center 환경에서는 단일 페이지 복사 공개 REST API가
+        제공되지 않는 경우가 많다. 따라서 Confluence가 실제 화면에서 사용하는
+        ``copypage.action → docopypage.action`` 흐름을 그대로 사용한다. 서버가 렌더링한
+        form(토큰 포함)을 읽어 다시 제출하므로, 원본 페이지의 표/레이아웃/매크로와
+        첨부파일은 Confluence 자체 복사 로직으로 유지된다.
+        """
+        copy_form_url = f"{conf_base}/pages/copypage.action"
+        opening = self._get_html_absolute(
+            copy_form_url,
+            params={
+                "idOfPageToCopy": str(source_page_id),
+                "idOfPageToCopyTo": str(target_parent_id or ""),
+                "spaceKey": space_key,
+            },
+        )
+        parser = _ConfluenceCopyFormParser()
+        parser.feed(opening.text or "")
+        parser.close()
+        form = parser.find_copy_form()
+        if not form:
+            raise ValueError(
+                "Confluence 페이지 복사 화면에서 저장 form을 찾지 못했습니다. "
+                "복사 권한 또는 Confluence 화면 구성을 확인하세요."
+            )
+
+        fields = list(form.get("fields") or [])
+        # 화면에 첨부파일 포함 옵션이 있으면 자동으로 체크한다. 이미지/파일을 참조하는
+        # 매크로가 원본과 동일하게 렌더링되도록 하기 위함이다.
+        for checkbox in form.get("checkboxes") or []:
+            checkbox_name = str(checkbox.get("name") or "")
+            normalized_name = checkbox_name.lower()
+            if checkbox_name and ("attachment" in normalized_name or "file" in normalized_name):
+                fields = self._replace_form_field(
+                    fields,
+                    checkbox_name,
+                    str(checkbox.get("value") or "true"),
+                )
+
+        fields = self._replace_form_field(fields, "title", new_title)
+        fields = self._replace_form_field(fields, "spaceKey", space_key)
+        # Confluence 버전에 따라 parentPageId/parentPageString 둘 중 하나만 쓰기도 하므로
+        # 둘 다 맞춰 준다. 일반 주차는 source form이 이미 동일 부모를 가리키며, 연도 전환은
+        # 새로운 연도별 상위 페이지로 명시적으로 바뀐다.
+        if target_parent_id:
+            fields = self._replace_form_field(fields, "parentPageId", str(target_parent_id))
+            if target_parent_title:
+                fields = self._replace_form_field(fields, "parentPageString", target_parent_title)
+        fields = self._replace_form_field(fields, "idOfPageToCopy", str(source_page_id))
+        fields = self._replace_form_field(fields, "idOfPageToCopyTo", str(target_parent_id or ""))
+
+        action = (form.get("action") or "").strip()
+        if not action:
+            action = f"docopypage.action?idOfPageToCopy={source_page_id}"
+        submit_url = urljoin(f"{conf_base}/pages/", action)
+        saved = self._post_form_absolute(submit_url, fields, referer=opening.url)
+
+        # Confluence는 저장 후 페이지 보기 화면으로 redirect하는 것이 정상이다. URL에서 ID를
+        # 우선 얻고, 버전별 redirect 차이는 같은 부모/제목의 페이지 검색으로 보완한다.
+        candidates = [saved.url or "", saved.headers.get("Location", "") or ""]
+        for candidate in candidates:
+            copied_id = self._extract_confluence_page_id(candidate)
+            if not copied_id:
+                m = re.search(r"[?&]pageId=(\d+)(?:&|$)", candidate)
+                copied_id = m.group(1) if m else ""
+            if copied_id:
+                return {
+                    "id": copied_id,
+                    "_links": {"webui": candidate[len(conf_base):] if candidate.startswith(conf_base) else ""},
+                }
+
+        # Redirect URL이 pageId를 노출하지 않는 설치 환경도 있으므로 제목/부모로 재확인한다.
+        for delay in (0.0, 0.3, 0.7, 1.2):
+            if delay:
+                time.sleep(delay)
+            copied = self._find_existing_confluence_sibling_page(
+                conf_base=conf_base,
+                space_key=space_key,
+                title=new_title,
+                parent_id=target_parent_id,
+            )
+            if copied:
+                return copied
+
+        page_preview = re.sub(r"\s+", " ", (saved.text or ""))[:400]
+        raise RuntimeError(
+            "Confluence 페이지 복사 요청 후 생성된 페이지를 확인하지 못했습니다. "
+            f"응답 URL: {saved.url} / 응답 일부: {page_preview}"
+        )
+
+    def _update_copied_page_week_range(
+        self,
+        conf_base: str,
+        copied_page_id: str,
+        new_title: str,
+        old_title: str,
+        week_info: dict,
+        target_parent_id: str,
+    ) -> dict:
+        """복사 완료 후 제목/주간 기간 텍스트만 최소 변경한다.
+
+        Confluence가 복사한 페이지의 storage 본문을 다시 읽고 날짜 관련 문자열만 치환한다.
+        원본 storage의 표/매크로/스타일 구조 전체를 유지하기 위한 처리다.
+        """
+        copied = self._get_json_absolute(
+            f"{conf_base}/rest/api/content/{copied_page_id}",
+            params={"expand": "body.storage,version,space,ancestors,_links"},
+        ) or {}
+
+        version_number = int(((copied.get("version") or {}).get("number") or 0))
+        if version_number <= 0:
+            raise ValueError("복사된 Confluence 페이지의 version 정보를 찾지 못했습니다.")
+
+        storage = (copied.get("body") or {}).get("storage") or {}
+        original_body = storage.get("value") or ""
+        updated_body = self._replace_weekly_date_ranges_in_body(
+            body=original_body,
+            old_title=old_title,
+            new_title=new_title,
+            old_start=week_info["start"],
+            old_end=week_info["end"],
+            new_start=week_info["next_start"],
+            new_end=week_info["next_end"],
+        )
+        representation = storage.get("representation") or "storage"
+
+        payload = {
+            "id": str(copied_page_id),
+            "type": "page",
+            "title": new_title,
+            "version": {"number": version_number + 1},
+            "body": {
+                "storage": {
+                    "value": updated_body,
+                    "representation": representation,
+                }
+            },
+        }
+        # 복사 API의 목적지 아래에 유지되도록 부모를 명시한다.
+        if target_parent_id:
+            payload["ancestors"] = [{"id": str(target_parent_id)}]
+
+        return self._put_json_absolute(
+            f"{conf_base}/rest/api/content/{copied_page_id}",
+            payload,
+        ) or {}
+
+    def _clone_confluence_page_storage(
+        self,
+        conf_base: str,
+        source_page_id: str,
+        target_parent_id: str,
+        space_key: str,
+        old_title: str,
+        new_title: str,
+        week_info: dict,
+    ) -> dict:
+        """원본 주간 페이지의 Confluence storage 본문을 다음 주 페이지로 복제한다.
+
+        실제 SEMES Confluence 9.2 복사 대화상자는 ``form action="#"``와
+        ``#copy-dialog-next`` 버튼으로 구성된 클라이언트 측 흐름이다. 따라서 예전처럼
+        ``docopypage.action`` form을 찾는 방식은 이 설치 환경에서 동작하지 않는다.
+
+        SCCB 주간 페이지에는 첨부파일이 없다는 전제에서, 원본의 storage format을 그대로
+        읽어 새 페이지 생성 요청에 넣는다. Storage format은 표/셀 병합/색상/매크로/
+        페이지 레이아웃 등 화면 포맷을 담고 있으므로, 본문을 재구성하지 않고 원본을
+        복제한 뒤 제목과 주간 날짜 범위만 최소 치환한다.
+        """
+        source = self._get_json_absolute(
+            f"{conf_base}/rest/api/content/{source_page_id}",
+            params={"expand": "body.storage,space,ancestors,_links"},
+        ) or {}
+
+        storage = (source.get("body") or {}).get("storage") or {}
+        source_body = storage.get("value")
+        if source_body is None:
+            raise ValueError(
+                "원본 Confluence 페이지의 storage 본문을 읽지 못했습니다. "
+                "페이지 조회 권한과 Confluence REST API 권한을 확인하세요."
+            )
+
+        cloned_body = self._replace_weekly_date_ranges_in_body(
+            body=source_body,
+            old_title=old_title,
+            new_title=new_title,
+            old_start=week_info["start"],
+            old_end=week_info["end"],
+            new_start=week_info["next_start"],
+            new_end=week_info["next_end"],
+        )
+        representation = storage.get("representation") or "storage"
+
+        payload = {
+            "type": "page",
+            "title": new_title,
+            "space": {"key": space_key},
+            "body": {
+                "storage": {
+                    "value": cloned_body,
+                    "representation": representation,
+                }
+            },
+        }
+        if target_parent_id:
+            payload["ancestors"] = [{"id": str(target_parent_id)}]
+
+        created = self._post_json_absolute(f"{conf_base}/rest/api/content", payload) or {}
+        created_id = str(created.get("id") or "").strip()
+        if not created_id:
+            raise ValueError("Confluence 주간 페이지 생성 후 page id를 받지 못했습니다.")
+        return created
+
+
+    @staticmethod
+    def _parse_meeting_minutes_confluence_title(
+        title: str,
+        parent_title: str = "",
+        reference_date=None,
+    ) -> dict:
+        """SCCB 회의록 제목의 주차와 회의일을 해석한다.
+
+        예) ``25W (06/22일) - 5건(A0, B3, C2)``
+
+        회의록의 주차 번호는 SCCB 주간 페이지의 ISO 주차와 한 칸 차이가 날 수 있어,
+        날짜를 ISO 주차로 재계산하지 않는다. 제목에 적힌 주차 번호는 그대로 다음 번호로
+        넘기고, 회의일만 7일 이동한다. 연도는 우선 ``26년 회의록 (SCCB)`` 같은
+        직접 상위 페이지 제목에서 얻는다.
+        """
+        from datetime import date, datetime
+        from zoneinfo import ZoneInfo
+
+        src = (title or "").strip()
+        pattern = re.compile(
+            r"(?P<week>\d{1,2})W\s*\(\s*"
+            r"(?P<month>\d{1,2})/(?P<day>\d{1,2})\s*일\s*\)"
+        )
+        match = pattern.search(src)
+        if not match:
+            raise ValueError(f"회의록 페이지 제목에서 주차/날짜 패턴을 찾지 못했습니다: {title}")
+
+        week = int(match.group("week"))
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+
+        parent_match = re.search(
+            r"(?P<year>\d{2,4})년\s*회의록\s*\(\s*SCCB\s*\)",
+            parent_title or "",
+            re.IGNORECASE,
+        )
+        if parent_match:
+            year = int(parent_match.group("year"))
+            if year < 100:
+                year += 2000
+            try:
+                meeting_date = date(year, month, day)
+            except ValueError as exc:
+                raise ValueError(f"회의록 제목의 날짜가 올바르지 않습니다: {title}") from exc
+        else:
+            today = reference_date or datetime.now(ZoneInfo("Asia/Seoul")).date()
+            candidates = []
+            for year in (today.year - 1, today.year, today.year + 1):
+                try:
+                    candidate = date(year, month, day)
+                except ValueError:
+                    continue
+                candidates.append((abs((candidate - today).days), candidate))
+            if not candidates:
+                raise ValueError(f"회의록 제목의 날짜가 올바르지 않습니다: {title}")
+            meeting_date = min(candidates, key=lambda item: item[0])[1]
+
+        return {
+            "match": match,
+            "week": week,
+            "date": meeting_date,
+        }
+
+    @classmethod
+    def _make_next_meeting_minutes_title(
+        cls,
+        title: str,
+        parent_title: str = "",
+        reference_date=None,
+    ) -> tuple[str, dict]:
+        """회의록 제목을 다음 주 회의일 기준으로 만든다.
+
+        예) ``25W (06/22일) - 5건(A0, B3, C2)``
+        -> ``26W (06/29일) - 5건(A0, B3, C2)``.
+
+        뒤의 건수/등급 문자열은 복제 시점의 기존 회의록 정보를 보존한다.
+        SCCB 리스트 매크로는 별도로 다음 주 완료일 범위로 바뀌므로, 실제 이슈 수는
+        새 페이지에서 Confluence/Jira가 다시 렌더링한 값으로 확인한다.
+        """
+        from datetime import timedelta
+
+        src = title or ""
+        info = cls._parse_meeting_minutes_confluence_title(
+            src,
+            parent_title=parent_title,
+            reference_date=reference_date,
+        )
+        next_date = info["date"] + timedelta(days=7)
+
+        # 회의록 관행의 주차 번호를 유지한다. 새해 첫 회의는 1W로 재시작한다.
+        if next_date.year != info["date"].year:
+            next_week = 1
+        else:
+            next_week = info["week"] + 1
+            if next_week > 53:
+                next_week = 1
+
+        replacement = f"{next_week}W ({next_date:%m/%d}일)"
+        match = info["match"]
+        return src[:match.start()] + replacement + src[match.end():], {
+            **info,
+            "next_date": next_date,
+            "next_week": next_week,
+        }
+
+    @staticmethod
+    def _make_yearly_meeting_minutes_parent_title(year: int) -> str:
+        """예: 2027 -> ``27년 회의록 (SCCB)``."""
+        return f"{int(year) % 100:02d}년 회의록 (SCCB)"
+
+    @staticmethod
+    def _replace_meeting_minutes_body(
+        body: str,
+        old_title: str,
+        new_title: str,
+        old_meeting_date,
+        new_meeting_date,
+    ) -> str:
+        """복제한 SCCB 회의록 본문에서 다음 주에 필요한 값만 바꾼다.
+
+        - ``날짜/시간`` 표의 Handy Date / 날짜 표시
+        - ``3. SCCB 리스트`` 아래 Jira 매크로의 ``SCCB 완료일`` 조건 날짜
+
+        일반 표의 과거 회의 내용과 이슈별 날짜는 건드리지 않는다.
+        """
+        from datetime import datetime, timedelta
+
+        text = body or ""
+        if old_title and new_title:
+            text = text.replace(old_title, new_title)
+
+        old_iso = old_meeting_date.strftime("%Y-%m-%d")
+        new_iso = new_meeting_date.strftime("%Y-%m-%d")
+        delta_days = (new_meeting_date - old_meeting_date).days
+
+        old_display_pattern = re.compile(
+            rf"{old_meeting_date.year}\s*\.\s*0?{old_meeting_date.month}\s*\.\s*"
+            rf"0?{old_meeting_date.day}\s*\.?"
+        )
+        new_display = f"{new_meeting_date.year}. {new_meeting_date.month}. {new_meeting_date.day}."
+
+        def replace_single_date(fragment: str) -> str:
+            fragment = re.sub(
+                rf"(?<!\d){re.escape(old_iso)}(?!\d)",
+                new_iso,
+                fragment,
+            )
+            return old_display_pattern.sub(new_display, fragment)
+
+        # Confluence view 형태: ``날짜/시간`` 행의 Handy Date time 태그.
+        # 해당 행 안에서만 날짜를 바꿔서 회의 본문/이슈 표의 개별 날짜는 유지한다.
+        date_row_pattern = re.compile(
+            r"<tr\b[^>]*>(?:(?!</tr>).)*?날짜\s*/\s*시간(?:(?!</tr>).)*?</tr>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        text = date_row_pattern.sub(
+            lambda match: replace_single_date(match.group(0)),
+            text,
+        )
+
+        # Storage XML에서는 플러그인 버전에 따라 date/handy-date macro로 저장된다.
+        # 매크로 본문에 기존 회의일이 실제로 있는 경우에만 갱신한다.
+        date_macro_pattern = re.compile(
+            r"<ac:structured-macro\b(?=[^>]*\bac:name\s*=\s*['\"][^'\"]*date[^'\"]*['\"])"
+            r"[^>]*>.*?</ac:structured-macro>",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        def replace_date_macro(match):
+            macro = match.group(0)
+            if old_iso not in macro and not old_display_pattern.search(macro):
+                return macro
+            return replace_single_date(macro)
+
+        text = date_macro_pattern.sub(replace_date_macro, text)
+
+        # ``3. SCCB 리스트``의 Jira 매크로는 JQL과 RAW 파라미터에 같은 조건을
+        # 두 번 보관한다. SCCB 완료일 조건 바로 뒤에 있는 날짜만 7일 이동하므로,
+        # created/개발 DR 완료일 등 고정 기준 날짜에는 영향이 없다.
+        jira_macro_pattern = re.compile(
+            r"<ac:structured-macro\b(?=[^>]*\bac:name\s*=\s*['\"]jira['\"])"
+            r"[^>]*>.*?</ac:structured-macro>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        completion_condition_pattern = re.compile(
+            r"(?P<prefix>"
+            r"(?:&quot;|\"|')?SCCB\s*완료일(?:&quot;|\"|')?\s*"
+            r"(?:&gt;=|&lt;=|&amp;gt;=|&amp;lt;=|>=|<=)\s*"
+            r")"
+            r"(?P<date>\d{4}-\d{1,2}-\d{1,2})",
+            re.IGNORECASE,
+        )
+
+        def replace_completion_date(match):
+            raw_date = match.group("date")
+            try:
+                parsed = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            except ValueError:
+                return match.group(0)
+            shifted = parsed + timedelta(days=delta_days)
+            return f"{match.group('prefix')}{shifted:%Y-%m-%d}"
+
+        def replace_jira_macro(match):
+            macro = match.group(0)
+            if "SCCB 완료일" not in macro:
+                return macro
+            return completion_condition_pattern.sub(replace_completion_date, macro)
+
+        text = jira_macro_pattern.sub(replace_jira_macro, text)
+        return text
+
+    def _clone_confluence_meeting_minutes_storage(
+        self,
+        conf_base: str,
+        source_page_id: str,
+        target_parent_id: str,
+        space_key: str,
+        old_title: str,
+        new_title: str,
+        meeting_info: dict,
+    ) -> dict:
+        """원본 SCCB 회의록 Storage를 복제해 다음 주 회의록을 만든다."""
+        source = self._get_json_absolute(
+            f"{conf_base}/rest/api/content/{source_page_id}",
+            params={"expand": "body.storage,space,ancestors,_links"},
+        ) or {}
+
+        storage = (source.get("body") or {}).get("storage") or {}
+        source_body = storage.get("value")
+        if source_body is None:
+            raise ValueError(
+                "원본 Confluence 회의록의 storage 본문을 읽지 못했습니다. "
+                "페이지 조회 권한과 Confluence REST API 권한을 확인하세요."
+            )
+
+        cloned_body = self._replace_meeting_minutes_body(
+            body=source_body,
+            old_title=old_title,
+            new_title=new_title,
+            old_meeting_date=meeting_info["date"],
+            new_meeting_date=meeting_info["next_date"],
+        )
+        representation = storage.get("representation") or "storage"
+
+        payload = {
+            "type": "page",
+            "title": new_title,
+            "space": {"key": space_key},
+            "body": {
+                "storage": {
+                    "value": cloned_body,
+                    "representation": representation,
+                }
+            },
+        }
+        if target_parent_id:
+            payload["ancestors"] = [{"id": str(target_parent_id)}]
+
+        created = self._post_json_absolute(f"{conf_base}/rest/api/content", payload) or {}
+        created_id = str(created.get("id") or "").strip()
+        if not created_id:
+            raise ValueError("Confluence 회의록 생성 후 page id를 받지 못했습니다.")
+        return created
+
+    def create_next_week_meeting_minutes_page_from_url(self, page_url: str) -> dict:
+        """현재 SCCB 회의록을 Storage 복제로 다음 주 회의록으로 만든다.
+
+        - 제목의 회의일을 7일 이동한다.
+        - 날짜/시간 표의 날짜를 다음 회의일로 이동한다.
+        - SCCB 리스트 Jira 매크로의 SCCB 완료일 범위를 7일 이동한다.
+        - 연도 전환 시 ``YY년 회의록 (SCCB)`` 상위 페이지를 만들거나 재사용한다.
+        """
+        page_id = self._extract_confluence_page_id(page_url)
+        if not page_id:
+            raise ValueError("Confluence 회의록 page id를 URL에서 찾지 못했습니다.")
+
+        conf_base = self._extract_confluence_base_url(page_url)
+        if not conf_base:
+            raise ValueError("Confluence base url을 URL에서 찾지 못했습니다.")
+
+        src = self._get_json_absolute(
+            f"{conf_base}/rest/api/content/{page_id}",
+            params={"expand": "title,space,ancestors"},
+        ) or {}
+
+        old_title = src.get("title") or ""
+        source_parent_id = self._get_page_parent_id(src)
+        source_parent = ((src.get("ancestors") or [])[-1] if (src.get("ancestors") or []) else {}) or {}
+        source_parent_title = str(source_parent.get("title") or "").strip()
+        new_title, meeting_info = self._make_next_meeting_minutes_title(
+            old_title,
+            parent_title=source_parent_title,
+        )
+
+        space_key = ((src.get("space") or {}).get("key") or "").strip()
+        if not space_key:
+            raise ValueError("원본 회의록의 space key를 찾지 못했습니다.")
+
+        target_parent_id = source_parent_id
+        yearly_parent_title = ""
+        yearly_parent_created = False
+
+        if meeting_info["next_date"].year != meeting_info["date"].year:
+            yearly_parent_title = self._make_yearly_meeting_minutes_parent_title(
+                meeting_info["next_date"].year
+            )
+            yearly_parent_parent_id = self._get_page_grandparent_id(src)
+            existing_yearly_parent = self._find_existing_confluence_sibling_page(
+                conf_base=conf_base,
+                space_key=space_key,
+                title=yearly_parent_title,
+                parent_id=yearly_parent_parent_id,
+            )
+            if existing_yearly_parent:
+                target_parent_id = str(existing_yearly_parent.get("id") or "").strip()
+            else:
+                yearly_parent_payload = {
+                    "type": "page",
+                    "title": yearly_parent_title,
+                    "space": {"key": space_key},
+                    "body": {
+                        "storage": {
+                            "value": "<p></p>",
+                            "representation": "storage",
+                        }
+                    },
+                }
+                if yearly_parent_parent_id:
+                    yearly_parent_payload["ancestors"] = [{"id": yearly_parent_parent_id}]
+
+                created_yearly_parent = self._post_json_absolute(
+                    f"{conf_base}/rest/api/content",
+                    yearly_parent_payload,
+                ) or {}
+                target_parent_id = str(created_yearly_parent.get("id") or "").strip()
+                if not target_parent_id:
+                    raise ValueError("새 연도 회의록 상위 페이지 생성 후 page id를 받지 못했습니다.")
+                yearly_parent_created = True
+
+        existing_page = self._find_existing_confluence_sibling_page(
+            conf_base=conf_base,
+            space_key=space_key,
+            title=new_title,
+            parent_id=target_parent_id,
+        )
+        if existing_page:
+            return {
+                "created": False,
+                "title": new_title,
+                "url": self._confluence_page_url(conf_base, existing_page),
+                "id": existing_page.get("id"),
+                "source_title": old_title,
+                "yearly_parent_title": yearly_parent_title,
+                "yearly_parent_created": yearly_parent_created,
+                "copy_mode": "existing",
+            }
+
+        created = self._clone_confluence_meeting_minutes_storage(
+            conf_base=conf_base,
+            source_page_id=page_id,
+            target_parent_id=target_parent_id,
+            space_key=space_key,
+            old_title=old_title,
+            new_title=new_title,
+            meeting_info=meeting_info,
+        )
+        created_page_id = str(created.get("id") or "").strip()
+        return {
+            "created": True,
+            "title": new_title,
+            "url": self._confluence_page_url(conf_base, created)
+            or f"{conf_base}/pages/viewpage.action?pageId={created_page_id}",
+            "id": created_page_id,
+            "source_title": old_title,
+            "yearly_parent_title": yearly_parent_title,
+            "yearly_parent_created": yearly_parent_created,
+            "copy_mode": "storage_clone",
+        }
+
+    def create_next_week_confluence_page_from_url(self, page_url: str) -> dict:
+        """
+        현재 주간 SCCB 페이지를 **원본 Storage 복제**로 다음 주차에 생성한다.
+
+        처리 내용
+        - 일반 주: 원본과 같은 연도별 상위 페이지 아래에 다음 주 페이지를 복제한다.
+        - 연말/연초: 다음 주 시작일의 연도가 바뀌면 ``YY년 사전 SCCB 기록``
+          상위 페이지를 같은 레벨에 만들거나 재사용하고, 그 아래에서 1W부터 복제한다.
+        - 원본의 표/매크로/레이아웃을 담은 storage 본문을 그대로 사용하고, 제목과
+          주간 날짜 범위만 생성 전에 최소 변경한다.
+        - 이미 같은 상위 페이지 아래에 같은 제목이 있으면 중복 생성하지 않고 기존 페이지를 반환한다.
+        """
+        page_id = self._extract_confluence_page_id(page_url)
+        if not page_id:
+            raise ValueError("Confluence page id를 URL에서 찾지 못했습니다.")
+
+        conf_base = self._extract_confluence_base_url(page_url)
+        if not conf_base:
+            raise ValueError("Confluence base url을 URL에서 찾지 못했습니다.")
+
+        src = self._get_json_absolute(
+            f"{conf_base}/rest/api/content/{page_id}",
+            params={"expand": "title,space,ancestors"},
+        ) or {}
+
+        old_title = src.get("title") or ""
+        new_title, week_info = self._make_next_week_title(old_title)
+        space_key = ((src.get("space") or {}).get("key") or "").strip()
+        if not space_key:
+            raise ValueError("원본 페이지의 space key를 찾지 못했습니다.")
+
+        source_parent_id = self._get_page_parent_id(src)
+        source_parent = ((src.get("ancestors") or [])[-1] if (src.get("ancestors") or []) else {}) or {}
+        target_parent_id = source_parent_id
+        target_parent_title = str(source_parent.get("title") or "").strip()
+        yearly_parent_title = ""
+        yearly_parent_created = False
+
+        # 2026년 마지막 주 -> 2027년 1W처럼 캘린더 연도가 넘어갈 때는,
+        # 기존 연도별 상위 페이지와 같은 레벨에 새 연도별 SCCB 기록 페이지를 둔다.
+        if week_info["next_start"].year != week_info["start"].year:
+            yearly_parent_title = self._make_yearly_sccb_parent_title(week_info["next_start"].year)
+            yearly_parent_parent_id = self._get_page_grandparent_id(src)
+            existing_yearly_parent = self._find_existing_confluence_sibling_page(
+                conf_base=conf_base,
+                space_key=space_key,
+                title=yearly_parent_title,
+                parent_id=yearly_parent_parent_id,
+            )
+            if existing_yearly_parent:
+                target_parent_id = str(existing_yearly_parent.get("id") or "").strip()
+                target_parent_title = str(existing_yearly_parent.get("title") or yearly_parent_title).strip()
+            else:
+                yearly_parent_payload = {
+                    "type": "page",
+                    "title": yearly_parent_title,
+                    "space": {"key": space_key},
+                    "body": {
+                        "storage": {
+                            "value": "<p></p>",
+                            "representation": "storage",
+                        }
+                    },
+                }
+                if yearly_parent_parent_id:
+                    yearly_parent_payload["ancestors"] = [{"id": yearly_parent_parent_id}]
+
+                created_yearly_parent = self._post_json_absolute(
+                    f"{conf_base}/rest/api/content", yearly_parent_payload
+                ) or {}
+                target_parent_id = str(created_yearly_parent.get("id") or "").strip()
+                if not target_parent_id:
+                    raise ValueError("새 연도 SCCB 기록 상위 페이지 생성 후 page id를 받지 못했습니다.")
+                yearly_parent_created = True
+                target_parent_title = yearly_parent_title
+
+        existing_page = self._find_existing_confluence_sibling_page(
+            conf_base=conf_base,
+            space_key=space_key,
+            title=new_title,
+            parent_id=target_parent_id,
+        )
+        if existing_page:
+            return {
+                "created": False,
+                "title": new_title,
+                "url": self._confluence_page_url(conf_base, existing_page),
+                "id": existing_page.get("id"),
+                "source_title": old_title,
+                "yearly_parent_title": yearly_parent_title,
+                "yearly_parent_created": yearly_parent_created,
+                "copy_mode": "existing",
+            }
+
+        copied = self._clone_confluence_page_storage(
+            conf_base=conf_base,
+            source_page_id=page_id,
+            target_parent_id=target_parent_id,
+            space_key=space_key,
+            old_title=old_title,
+            new_title=new_title,
+            week_info=week_info,
+        )
+        copied_page_id = str(copied.get("id") or "").strip()
+
+        return {
+            "created": True,
+            "title": new_title,
+            "url": self._confluence_page_url(conf_base, copied) or f"{conf_base}/pages/viewpage.action?pageId={copied_page_id}",
+            "id": copied_page_id,
+            "source_title": old_title,
+            "yearly_parent_title": yearly_parent_title,
+            "yearly_parent_created": yearly_parent_created,
+            "copy_mode": "storage_clone",
+        }
 
     @staticmethod
     def _extract_keys_from_confluence_body(body_text: str) -> set[str]:

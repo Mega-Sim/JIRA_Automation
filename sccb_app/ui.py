@@ -55,7 +55,7 @@ class JiraSccbApp(tb.Window):
             style.configure('Treeview', rowheight=int(round(cur_rh * 1.1)))
         except Exception:
             pass
-        self.title("Jira SCCB Automation")
+        self.title("Jira SCCB Automation v96")
         self.geometry("1500x900")
 
         self.base_url_var = tk.StringVar(value=DEFAULT_BASE_URL)
@@ -158,8 +158,14 @@ class JiraSccbApp(tb.Window):
         tb.Button(preset, text="SCCB 미대상", bootstyle=WARNING, command=self.on_sccb_not_target, width=BTN_W).pack(side=LEFT)
         tb.Button(preset, text="SCCB 대상", bootstyle=PRIMARY, command=self.on_sccb_target, width=BTN_W).pack(side=LEFT, padx=8)
         tb.Button(preset, text="VOC 완료처리", bootstyle=INFO, command=self.on_voc_complete, width=BTN_W).pack(side=LEFT)
+        tb.Button(preset, text="SCCB Page 생성", bootstyle=SUCCESS, command=self.on_create_sccb_page, width=BTN_W).pack(side=LEFT, padx=(8, 0))
+        tb.Button(preset, text="회의록 Page 생성", bootstyle=SUCCESS, command=self.on_create_meeting_page, width=BTN_W).pack(side=LEFT, padx=(8, 0))
 
-        weekly_url = tb.Labelframe(frm, text="이번주 SCCB URL", padding=10)
+        weekly_url = tb.Labelframe(
+            frm,
+            text="이번주 SCCB URL (이전 주 Page 포맷 복제 후 다음 주 URL로 자동 변경)",
+            padding=10,
+        )
         weekly_url.pack(fill=X, pady=(0, 0))
         tb.Entry(weekly_url, textvariable=self.weekly_sccb_url_var).pack(fill=X)
 
@@ -172,6 +178,7 @@ class JiraSccbApp(tb.Window):
 
         tb.Button(btn_row, text="Search", bootstyle=SECONDARY, command=self.on_search, width=BTN_W).pack(side=LEFT)
         tb.Button(btn_row, text="Open Selected", bootstyle=INFO, command=self.open_selected_issue, width=BTN_W).pack(side=LEFT, padx=8)
+        tb.Button(btn_row, text="선택 이슈 Approval", bootstyle=WARNING, command=self.on_process_selected_approval, width=BTN_W).pack(side=LEFT, padx=8)
         tb.Button(btn_row, text="선택 이슈 Complete", bootstyle=DANGER, command=self.on_process_selected, width=BTN_W).pack(side=LEFT, padx=8)
         tb.Button(btn_row, text="Export Excel", bootstyle=PRIMARY, command=self.on_export_excel, width=BTN_W).pack(side=LEFT, padx=8)
 
@@ -468,6 +475,146 @@ class JiraSccbApp(tb.Window):
         self.sccb_mode = "voc_complete"
         self.on_search()
 
+    def _create_next_week_page_from_url(
+        self,
+        label: str,
+        page_url: str,
+        create_method_name: str,
+        update_url_var=None,
+    ):
+        source_url = (page_url or "").strip()
+        if not source_url:
+            Messagebox.show_warning(f"{label} 원본 URL을 입력하세요.", title="경고")
+            return
+
+        def worker():
+            try:
+                self.log(f"{label} 이전 주 페이지 포맷 복제 시작 - 원본: {source_url}")
+                jira = self._make_client()
+                create_method = getattr(jira, create_method_name)
+                result = create_method(source_url)
+                source_title = result.get("source_title") or ""
+                title = result.get("title") or ""
+                url = result.get("url") or ""
+                created = bool(result.get("created"))
+
+                if created:
+                    msg = f"{label} 생성 완료: {title}"
+                else:
+                    msg = f"{label} 이미 존재: {title}"
+                if source_title:
+                    msg += f" (원본: {source_title})"
+                yearly_parent_title = result.get("yearly_parent_title") or ""
+                if yearly_parent_title:
+                    if result.get("yearly_parent_created"):
+                        msg += f" / 상위 페이지 생성: {yearly_parent_title}"
+                    else:
+                        msg += f" / 상위 페이지 사용: {yearly_parent_title}"
+                if url:
+                    msg += f" / {url}"
+                self.log(msg)
+
+                def show_done():
+                    if update_url_var is not None and url:
+                        update_url_var.set(url)
+                    Messagebox.show_info(msg, title="완료")
+                    if url:
+                        webbrowser.open(url)
+
+                self.after(0, show_done)
+            except Exception as e:
+                self.log(f"{label} 생성 실패 - {e}")
+                self.after(
+                    0,
+                    lambda: Messagebox.show_error(
+                        f"{label} 생성 실패\n{e}",
+                        title="오류",
+                    ),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_create_sccb_page(self):
+        self._create_next_week_page_from_url(
+            "SCCB Page",
+            self.weekly_sccb_url_var.get(),
+            "create_next_week_confluence_page_from_url",
+            update_url_var=self.weekly_sccb_url_var,
+        )
+
+    def on_create_meeting_page(self):
+        """회의록 원본 URL을 팝업에서 받은 뒤 다음 주 회의록을 생성한다.
+
+        메인 화면은 이번주 SCCB URL만 유지한다. 회의록은 매번 다른 원본을
+        지정할 수 있도록 생성 버튼을 눌렀을 때만 URL 입력 팝업을 띄운다.
+        """
+        dialog = tb.Toplevel(self)
+        dialog.title("회의록 원본 URL 입력")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        container = tb.Frame(dialog, padding=16)
+        container.pack(fill=BOTH, expand=YES)
+
+        tb.Label(
+            container,
+            text="이번주 회의록 페이지 URL을 입력하세요.",
+            anchor=W,
+        ).pack(fill=X)
+
+        url_var = tk.StringVar(value="")
+        entry = tb.Entry(container, textvariable=url_var, width=82)
+        entry.pack(fill=X, pady=(8, 12))
+
+        button_row = tb.Frame(container)
+        button_row.pack(fill=X)
+
+        def close_dialog():
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        def submit(event=None):
+            source_url = (url_var.get() or "").strip()
+            if not source_url:
+                Messagebox.show_warning(
+                    "회의록 원본 URL을 입력하세요.",
+                    title="경고",
+                )
+                entry.focus_set()
+                return "break" if event is not None else None
+
+            close_dialog()
+            self._create_next_week_page_from_url(
+                "회의록 Page",
+                source_url,
+                "create_next_week_meeting_minutes_page_from_url",
+            )
+            return "break" if event is not None else None
+
+        tb.Button(
+            button_row,
+            text="확인",
+            bootstyle=SUCCESS,
+            command=submit,
+            width=12,
+        ).pack(side=RIGHT)
+        tb.Button(
+            button_row,
+            text="취소",
+            bootstyle=SECONDARY,
+            command=close_dialog,
+            width=12,
+        ).pack(side=RIGHT, padx=(0, 8))
+
+        entry.bind("<Return>", submit)
+        dialog.bind("<Escape>", lambda event: close_dialog())
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        entry.focus_set()
+
     def on_check_login(self):
         def worker():
             try:
@@ -641,11 +788,13 @@ class JiraSccbApp(tb.Window):
                                 except Exception:
                                     return None
 
-                            # 본문 길이 - 원본 그대로 (2회 재시도)
+                            # 본문 길이 - 2회 재시도 (권한없음이면 즉시 중단)
                             body_len = None
                             for _ in range(2):
                                 body_len = _safe_call(jira.get_body_length_string_from_ui, k)
                                 if body_len:
+                                    break
+                                if body_len == 'N/A(권한없음)':
                                     break
                             
                             # TC, AIO, PR - 원본 그대로
@@ -656,12 +805,12 @@ class JiraSccbApp(tb.Window):
                             def _apply_slow(body_len=body_len, tc_res=tc_res, aio_res=aio_res, pr_res=pr_res):
                                 if iid not in self.iid_by_key.values():
                                     return
-                                self.tree.set(iid, 'body_len', body_len or 'ERR')
+                                self.tree.set(iid, 'body_len', body_len if body_len is not None and body_len != '' else '확인불가')
                                 tc_ok = bool((tc_res or {}).get('ok', False))
                                 self.tree.set(iid, 'tcgen', 'OK' if tc_ok else 'FAIL')
                                 aio_status = (aio_res or {}).get('status') or 'ERR'
                                 self.tree.set(iid, 'aio_test', aio_status)
-                                self.tree.set(iid, 'pr_merge', pr_res or 'ERR')
+                                self.tree.set(iid, 'pr_merge', pr_res if pr_res is not None else 'ERR')
                                 self._apply_zebra()
 
                             self.after(0, _apply_slow)
@@ -682,7 +831,7 @@ class JiraSccbApp(tb.Window):
 
                     # ThreadPoolExecutor로 병렬 처리 (10 workers)
                     def run_all_checks():
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                             futures = []
                             for k, iid in list(self.iid_by_key.items()):
                                 future = executor.submit(fetch_and_set, k, iid)
@@ -722,6 +871,8 @@ class JiraSccbApp(tb.Window):
         if not aio_test or 'OK' not in (aio_test or '').upper():
             return 'FAIL'
         if not pr_merge or "MERGED" not in (pr_merge or "").upper():
+            if pr_merge and "N/A" in pr_merge.upper():
+                return "N/A"
             return "FAIL"
         return "OK"
 
@@ -798,6 +949,39 @@ class JiraSccbApp(tb.Window):
             webbrowser.open(f"{self.base_url_var.get().rstrip('/')}/browse/{k}")
             return
         Messagebox.show_info("선택된 이슈가 없습니다.", title="안내")
+
+    def on_process_selected_approval(self):
+        keys = [k for k, v in self.selected.items() if v]
+        if not keys:
+            Messagebox.show_warning("처리할 이슈를 선택하세요.", title="선택 없음")
+            return
+
+        jira = self._make_client()
+        wf = TransitionWorkflow(
+            jira_client=jira,
+            log_fn=self.log,
+            sccb_mode_getter=lambda: self.sccb_mode
+        )
+
+        def worker():
+            self.log(f"Approval 전이 시작: {keys}")
+            for k in keys:
+                try:
+                    wf.process_issue_to_approval(k, cached_status=self.issue_status.get(k))
+                    # 전이 성공 시 캐시/그리드 상태 갱신
+                    try:
+                        new_st = jira.get_issue_status(k)
+                        self.issue_status[k] = new_st
+                        iid = self.iid_by_key.get(k)
+                        if iid:
+                            self.after(0, lambda iid=iid, st=new_st: self.tree.set(iid, "status", st))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.log(f"{k}: 실패 - {e}")
+            self.log("Approval 전이 종료")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_process_selected(self):
         keys = [k for k, v in self.selected.items() if v]

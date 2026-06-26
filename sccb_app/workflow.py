@@ -1,4 +1,5 @@
 import time
+import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -70,6 +71,36 @@ class TransitionWorkflow:
         # 전주 수요일 = 이번 주 월요일 기준 5일 전
         prev_wed = d - timedelta(days=d.weekday() + 5)
         return prev_wed.strftime("%Y-%m-%d")
+
+    def _voc_start_end_date_policy(self):
+        """VOC 완료처리용 날짜 정책.
+
+        End Date는 처리 클릭일(오늘)로 두고, Start Date는 End Date보다
+        13/14/15일 빠른 날짜 중 하나를 VOC 이슈별로 랜덤 적용한다.
+        Jira REST date 필드는 YYYY-MM-DD 형식으로 전달한다.
+        """
+        end_date = datetime.now(TZ).date()
+        diff_days = random.choice((13, 14, 15))
+        start_date = end_date - timedelta(days=diff_days)
+        return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), diff_days
+
+    def _is_end_date_field(self, fid: str, name: str) -> bool:
+        n = norm_field_name(name)
+        return (
+            name == "End Date"
+            or fid == "customfield_11903"
+            or ("enddate" in n)
+            or ("end" in n and "date" in n)
+        )
+
+    def _is_start_date_field(self, fid: str, name: str) -> bool:
+        n = norm_field_name(name)
+        return (
+            name in ("Start Date", "Start date", "StartDate")
+            or ("startdate" in n)
+            or ("start" in n and "date" in n)
+            or ("시작" in name and ("일" in name or "날짜" in name))
+        )
 
     def _policy_sccb_value_label(self) -> str:
         return "SCCB 완료"
@@ -143,7 +174,7 @@ class TransitionWorkflow:
             name = (meta.get("name") or "").strip()
             n = norm_field_name(name)
 
-            if name == "End Date" or fid == "customfield_11903" or ("enddate" in n) or ("end" in n and "date" in n):
+            if self._is_end_date_field(fid, name):
                 payload["fields"][fid] = self._policy_end_date_str()
                 continue
 
@@ -204,14 +235,18 @@ class TransitionWorkflow:
             self.log(f"{parent_issue_key} -> {voc_key}: Done 전이 없음 (현재={cur})")
             return
 
-        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        voc_start_date, voc_end_date, voc_diff_days = self._voc_start_end_date_policy()
 
         pre_fields = {}
         fid_end = self.jira.find_field_id("End Date")
         if fid_end:
-            pre_fields[fid_end] = today
-        elif True:
-            pre_fields["customfield_11903"] = today
+            pre_fields[fid_end] = voc_end_date
+        else:
+            pre_fields["customfield_11903"] = voc_end_date
+
+        fid_start = self.jira.find_field_id("Start Date") or self.jira.find_field_id("Start date")
+        if fid_start:
+            pre_fields[fid_start] = voc_start_date
 
         if pre_fields:
             self.jira.update_issue_fields(voc_key, pre_fields)
@@ -222,8 +257,12 @@ class TransitionWorkflow:
             name = (meta or {}).get("name") or ""
             n = norm_field_name(name)
 
-            if name == "End Date" or fid == "customfield_11903" or ("enddate" in n) or ("end" in n and "date" in n):
-                extra_fields[fid] = today
+            if self._is_end_date_field(fid, name):
+                extra_fields[fid] = voc_end_date
+                continue
+
+            if self._is_start_date_field(fid, name):
+                extra_fields[fid] = voc_start_date
                 continue
 
             if name == "해결책" or "해결책" in name or "해결책" in n or n == "resolution":
@@ -234,7 +273,48 @@ class TransitionWorkflow:
                 continue
 
         self._do_transition(voc_key, t_done, extra_fields=extra_fields)
-        self.log(f"{parent_issue_key} -> {voc_key}: Done 처리 완료")
+        self.log(
+            f"{parent_issue_key} -> {voc_key}: Done 처리 완료 "
+            f"(Start Date={voc_start_date}, End Date={voc_end_date}, 차이={voc_diff_days}일)"
+        )
+
+    def process_issue_to_approval(self, issue_key: str, cached_status: str | None = None):
+        """선택 이슈를 'Approval' 상태로만 전이한다 (Complete까지 가지 않음)."""
+        cur = (cached_status or "").strip() or self.jira.get_issue_status(issue_key)
+        cur_l = cur.lower()
+
+        if cur_l in ("approval", "approver"):
+            self.log(f"{issue_key}: 이미 Approval 상태")
+            return
+
+        if cur_l != "in verification":
+            self.log(f"{issue_key}: 스킵 (현재 상태={cur}, In Verification만 Approval 전이 가능)")
+            return
+
+        trans = self.jira.get_transitions(issue_key)
+        self._debug_print_transitions(issue_key, trans)
+
+        t_to_approval = (
+            self._find_transition_to_status(trans, "Approval")
+            or self._find_transition_to_status(trans, "Approver")
+            or self._find_transition_by_name(trans, "approval")
+            or self._find_transition_by_name(trans, "approver")
+        )
+        if not t_to_approval:
+            self.log(f"{issue_key}: Approval/Approver 전이 없음 (현재={cur})")
+            return
+
+        self._do_transition(issue_key, t_to_approval)
+        to_name = (t_to_approval.get("to") or {}).get("name") or "Approval"
+        self.log(f"{issue_key}: {cur} -> {to_name}")
+
+        # 반영 확인 (최대 6초)
+        for _ in range(10):
+            time.sleep(0.6)
+            if self.jira.get_issue_status(issue_key).strip().lower() in ("approval", "approver"):
+                self.log(f"{issue_key}: Approval 반영 확인 완료")
+                return
+        self.log(f"{issue_key}: Approval 반영 확인 실패 (Jira에서 직접 확인 필요)")
 
     def process_issue_to_complete(self, issue_key: str, cached_status: str | None = None):
         cur = (cached_status or "").strip() or self.jira.get_issue_status(issue_key)
@@ -250,7 +330,7 @@ class TransitionWorkflow:
                 return
 
             self._do_transition(issue_key, t_to_approval)
-            self.log(f"{issue_key}: In Verification -> {(t_to_approval.get("to") or {}).get("name") or "Approval"}")
+            self.log(f"{issue_key}: In Verification -> {(t_to_approval.get('to') or {}).get('name') or 'Approval'}")
 
             ok = False
             for _ in range(10):
