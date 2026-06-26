@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jira SCCB Automation</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── 접속 정보 ── -->
+    <section class="card" id="section-conn">
+      <div class="card-title">접속 정보</div>
+      <div class="conn-grid">
+        <div class="conn-left">
+          <div class="field-row">
+            <label class="field-label">Base URL</label>
+            <input id="base-url" type="text" class="input-wide"
+                   value="https://jira-stms.semes.com:18080" placeholder="https://jira.example.com">
+          </div>
+          <div class="field-row" style="margin-top:8px">
+            <label class="field-label">ID</label>
+            <input id="user-id" type="text" class="input-mid" placeholder="사용자 ID">
+            <span id="login-status" class="login-status">로그인: 미확인</span>
+          </div>
+          <div class="field-row" style="margin-top:6px">
+            <label class="field-label">PW</label>
+            <input id="user-pw" type="password" class="input-mid" placeholder="비밀번호">
+            <button class="btn btn-success" id="btn-login" onclick="checkLogin()">Login 확인</button>
+          </div>
+        </div>
+        <div class="conn-right">
+          <label class="checkbox-row">
+            <input type="checkbox" id="ssl-verify" checked> SSL verify
+          </label>
+          <div class="field-row" style="margin-top:8px">
+            <label class="field-label">Max Results</label>
+            <input id="max-results" type="number" value="50" min="1" max="500" class="input-num">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 프리셋 버튼 ── -->
+    <section class="card" id="section-presets">
+      <div class="btn-row">
+        <button class="btn btn-warning" onclick="onSccbNotTarget()">SCCB 미대상</button>
+        <button class="btn btn-primary" onclick="onSccbTarget()">SCCB 대상</button>
+        <button class="btn btn-info" onclick="onVocComplete()">VOC 완료처리</button>
+        <button class="btn btn-success" onclick="onCreateSccbPage()">SCCB Page 생성</button>
+        <button class="btn btn-success" onclick="onCreateMeetingPage()">회의록 Page 생성</button>
+      </div>
+    </section>
+
+    <!-- ── 이번주 SCCB URL ── -->
+    <section class="card">
+      <div class="card-title">이번주 SCCB URL
+        <span class="card-hint">(이전 주 Page 포맷 복제 후 다음 주 URL로 자동 변경)</span>
+      </div>
+      <input id="weekly-url" type="text" class="input-full" placeholder="https://confluence.example.com/...">
+    </section>
+
+    <!-- ── JQL ── -->
+    <section class="card">
+      <div class="card-title">JQL</div>
+      <input id="jql-input" type="text" class="input-full" placeholder="JQL을 직접 입력하거나 위 프리셋 버튼을 누르세요.">
+    </section>
+
+    <!-- ── 검색 / 액션 버튼 ── -->
+    <section class="card">
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="onSearch()">Search</button>
+        <button class="btn btn-info" onclick="openSelected()">Open Selected</button>
+        <button class="btn btn-warning" onclick="onApproval()">선택 이슈 Approval</button>
+        <button class="btn btn-danger" onclick="onComplete()">선택 이슈 Complete</button>
+        <button class="btn btn-primary" onclick="onExportExcel()">Export Excel</button>
+        <span id="status-msg" class="status-msg"></span>
+      </div>
+    </section>
+
+    <!-- ── 결과 테이블 ── -->
+    <section class="card card-result">
+      <div class="card-title">결과</div>
+      <div class="table-wrapper">
+        <table id="result-table">
+          <thead>
+            <tr>
+              <th class="col-sel">
+                <input type="checkbox" id="select-all" onchange="toggleSelectAll(this.checked)">
+              </th>
+              <th data-col="key" onclick="sortTable('key')">KEY <span class="sort-ind" data-col="key"></span></th>
+              <th data-col="summary" onclick="sortTable('summary')">SUMMARY <span class="sort-ind" data-col="summary"></span></th>
+              <th data-col="body_len" onclick="sortTable('body_len')">본문 길이 <span class="sort-ind" data-col="body_len"></span></th>
+              <th data-col="rollout" onclick="sortTable('rollout')">설계횡전개 <span class="sort-ind" data-col="rollout"></span></th>
+              <th data-col="err_table" onclick="sortTable('err_table')">연관 에러 <span class="sort-ind" data-col="err_table"></span></th>
+              <th data-col="links" onclick="sortTable('links')">이슈연결 상태 <span class="sort-ind" data-col="links"></span></th>
+              <th data-col="tcgen" onclick="sortTable('tcgen')">LLM TC 생성 <span class="sort-ind" data-col="tcgen"></span></th>
+              <th data-col="aio_test" onclick="sortTable('aio_test')">AIO Test <span class="sort-ind" data-col="aio_test"></span></th>
+              <th data-col="pr_merge" onclick="sortTable('pr_merge')">P/R 병합 <span class="sort-ind" data-col="pr_merge"></span></th>
+              <th data-col="status" onclick="sortTable('status')">STATUS <span class="sort-ind" data-col="status"></span></th>
+              <th data-col="assignee" onclick="sortTable('assignee')">ASSIGNEE <span class="sort-ind" data-col="assignee"></span></th>
+              <th data-col="duedate" onclick="sortTable('duedate')">기한일 <span class="sort-ind" data-col="duedate"></span></th>
+            </tr>
+          </thead>
+          <tbody id="result-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── 처리 로그 ── -->
+    <section class="card">
+      <div class="card-title">처리 로그</div>
+      <div id="log-area" class="log-area"></div>
+    </section>
+
+  </div><!-- #app -->
+
+  <!-- ── 회의록 URL 입력 다이얼로그 ── -->
+  <div id="meeting-dialog" class="dialog-overlay" style="display:none">
+    <div class="dialog-box">
+      <div class="dialog-title">회의록 원본 URL 입력</div>
+      <p class="dialog-desc">이번주 회의록 페이지 URL을 입력하세요.</p>
+      <input id="meeting-url-input" type="text" class="input-full" placeholder="https://confluence.example.com/...">
+      <div class="dialog-btns">
+        <button class="btn btn-secondary" onclick="closeMeetingDialog()">취소</button>
+        <button class="btn btn-success" onclick="submitMeetingDialog()">확인</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
