@@ -1,0 +1,36 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # 수동 실행 버튼
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller tzdata
+
+      - name: Build executable
+        run: pyinstaller jira_sccb.spec --clean --noconfirm
+
+      - name: Rename output
+        run: mv dist/JiraSCCB.exe dist/JiraSCCB-windows.exe
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: JiraSCCB-Windows
+          path: dist/JiraSCCB-windows.exe
+          retention-days: 90
