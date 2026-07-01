@@ -12,6 +12,18 @@ python -m sccb_app.app
 
 ---
 
+## Python 없이 실행하기
+
+Python이 설치되어 있지 않은 사용자는 저장소의 `releases/` 폴더에 있는 빌드된 실행파일을 사용할 수 있습니다.
+
+- Windows: `releases/JiraSCCB.exe`를 더블클릭해서 실행합니다.
+- Linux: `releases/JiraSCCB-linux`
+  - 실행 권한이 없으면 `chmod +x releases/JiraSCCB-linux`를 먼저 실행하세요.
+
+실행파일 보관 및 갱신 절차는 `releases/README.md`를 참고하세요.
+
+---
+
 ## 주요 기능
 
 ### 1. 접속 및 로그인

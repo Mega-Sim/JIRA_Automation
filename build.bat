@@ -41,9 +41,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if not exist releases mkdir releases
+copy /Y dist\JiraSCCB.exe releases\JiraSCCB.exe >nul
+if errorlevel 1 (
+    echo [오류] releases 폴더로 실행파일 복사 실패
+    pause
+    exit /b 1
+)
+
 echo.
 echo =============================================
 echo   빌드 완료!
-echo   실행파일 위치: dist\JiraSCCB.exe
+echo   실행파일 위치: releases\JiraSCCB.exe
+echo   Python 없는 사용자도 이 exe를 더블클릭해서 실행할 수 있습니다.
 echo =============================================
 pause
