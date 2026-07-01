@@ -63,14 +63,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "dist\JiraSCCB.exe" (
-    echo [오류] dist\JiraSCCB.exe 파일을 찾을 수 없습니다.
-    pause
-    exit /b 1
-)
-
-if not exist "releases" mkdir "releases"
-copy /Y "dist\JiraSCCB.exe" "releases\JiraSCCB.exe" >nul
+if not exist releases mkdir releases
+copy /Y dist\JiraSCCB.exe releases\JiraSCCB.exe >nul
 if errorlevel 1 (
     echo [오류] releases 폴더로 실행파일 복사 실패
     pause
@@ -80,7 +74,7 @@ if errorlevel 1 (
 echo.
 echo =============================================
 echo   빌드 완료!
-echo   실행파일 위치: %CD%\releases\JiraSCCB.exe
-echo   이제 releases\JiraSCCB.exe 를 더블클릭해서 실행하세요.
+echo   실행파일 위치: releases\JiraSCCB.exe
+echo   Python 없는 사용자도 이 exe를 더블클릭해서 실행할 수 있습니다.
 echo =============================================
 pause
