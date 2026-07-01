@@ -1571,8 +1571,20 @@ class JiraClient:
             if isinstance(desc, str) and desc.strip():
                 if debug:
                     print(f"\n[DEBUG] HTML/Wiki 파싱 시도")
-                
-                plain = re.sub(r"<[^>]+>", " ", desc)
+
+                # 표(table) 내용을 '먼저' 제거해야 한다.
+                # 주의: HTML 태그를 먼저 통째로 지우면 <table> 태그도 함께 사라져
+                #       표 헤더/셀 텍스트(예: '에러명', '설비 유형')가 본문 텍스트로 남아
+                #       빈 표인데도 '사유 작성'으로 오판정된다. (버그)
+                #   (a) HTML 표: <table>...</table> 블록 제거
+                #   (b) Jira wiki markup 표: '|' 로 시작하는 표 행(||헤더||, |셀|) 라인 제거
+                no_table = re.sub(r"<table[\s\S]*?</table>", "\n", desc, flags=re.IGNORECASE)
+                no_table = "\n".join(
+                    line for line in no_table.splitlines()
+                    if not re.match(r"^\s*\|", line)
+                )
+
+                plain = re.sub(r"<[^>]+>", " ", no_table)
                 plain = re.sub(r"\s+", " ", plain)
                 
                 if debug:
@@ -1614,9 +1626,10 @@ class JiraClient:
                     print(f"[DEBUG HTML] section 길이: {len(section)}")
                     print(f"[DEBUG HTML] section 내용:\n{section[:500]}")
 
-                # table 텍스트 제거(대략)
+                # 표 텍스트는 위에서 이미 제거됨(HTML <table> 블록 및 wiki 표 행).
+                # 혹시 남아있을 수 있는 인라인 <table> 잔여물만 방어적으로 한 번 더 제거.
                 section = re.sub(r"<table[\s\S]*?</table>", " ", section, flags=re.IGNORECASE)
-                
+
                 if debug:
                     print(f"[DEBUG HTML] table 제거 후 section:\n{section[:500]}")
 
