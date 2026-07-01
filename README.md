@@ -2,12 +2,26 @@
 
 Jira와 Confluence를 연동하여 SCCB(소프트웨어 변경 통제 회의) 업무를 자동화하는 데스크톱 GUI 도구입니다.
 
+<img width="1495" height="903" alt="1" src="https://github.com/user-attachments/assets/0096ee32-0fcc-4418-a37d-79b31511b4b9" />
+
 ## 실행
 
 ```bash
 pip install -r requirements.txt
 python -m sccb_app.app
 ```
+
+
+---
+## Python 없이 실행하기
+
+Python이 설치되어 있지 않은 사용자는 저장소의 `releases/` 폴더에 있는 빌드된 실행파일을 사용할 수 있습니다.
+
+- Windows: build.bat 실행 후 `releases/JiraSCCB.exe`를 더블클릭해서 실행합니다.
+- Linux: `releases/JiraSCCB-linux`
+  - 실행 권한이 없으면 `chmod +x releases/JiraSCCB-linux`를 먼저 실행하세요.
+
+실행파일 보관 및 갱신 절차는 `releases/README.md`를 참고하세요.
 
 ---
 
