@@ -1,6 +1,12 @@
 @echo off
 setlocal
 
+REM Switch the console code page to UTF-8 so the Korean text in this
+REM script displays correctly and cmd.exe does not misparse the
+REM UTF-8 bytes under the default (CP949) Korean code page, which can
+REM break "if (...)" blocks and cause double-click execution to fail.
+chcp 65001 >nul
+
 REM Always run from the folder that contains this batch file.
 REM This makes double-click execution work even if Windows starts the
 REM script with a different current working directory.
@@ -59,6 +65,12 @@ echo [4/4] 실행파일 빌드 중...
 %PY_CMD% -m PyInstaller jira_sccb.spec --clean --noconfirm
 if errorlevel 1 (
     echo [오류] 빌드 실패
+    pause
+    exit /b 1
+)
+
+if not exist "dist\JiraSCCB.exe" (
+    echo [오류] dist\JiraSCCB.exe 파일을 찾을 수 없습니다.
     pause
     exit /b 1
 )
