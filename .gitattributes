@@ -1,3 +1,7 @@
 # Keep packaged desktop executables in git as binary release assets.
 releases/JiraSCCB-linux binary
 releases/JiraSCCB.exe binary
+
+# Windows batch files must keep CRLF line endings regardless of the
+# committer's platform, or cmd.exe can fail to parse them correctly.
+*.bat text eol=crlf
