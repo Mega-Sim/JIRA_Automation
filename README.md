@@ -1,6 +1,7 @@
 # SCCB Automation
 
 Jira와 Confluence를 연동하여 SCCB(소프트웨어 변경 통제 회의) 업무를 자동화하는 데스크톱 GUI 도구입니다.
+
 <img width="1495" height="903" alt="1" src="https://github.com/user-attachments/assets/0096ee32-0fcc-4418-a37d-79b31511b4b9" />
 
 ## 실행
