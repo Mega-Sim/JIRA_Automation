@@ -1,0 +1,3 @@
+# Keep packaged desktop executables in git as binary release assets.
+releases/JiraSCCB-linux binary
+releases/JiraSCCB.exe binary
