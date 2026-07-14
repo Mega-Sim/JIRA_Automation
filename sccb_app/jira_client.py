@@ -2812,8 +2812,12 @@ class JiraClient:
 
         region = macro_pat.sub(replace_macro, region)
 
-        # 2) 화면 HTML 형식: <time datetime=...> 요소를 순서대로 덮어쓴다
-        time_pat = re.compile(r"<time\b[^>]*>.*?</time>", re.IGNORECASE | re.DOTALL)
+        # 2) <time> 요소를 순서대로 덮어쓴다. Confluence 기본 Date 인라인 요소는
+        #    ``<time datetime="2026-07-06"/>``처럼 표시 텍스트 없이 self-closing으로
+        #    저장되고(화면에서 날짜를 자체 렌더링), Handy Date 등 일부 매크로는
+        #    ``<time ...>2026. 7. 6.</time>``처럼 닫는 태그와 표시 텍스트를 갖는다.
+        #    두 형태를 모두 지원한다.
+        time_pat = re.compile(r"<time\b[^>]*?(?:/>|>.*?</time\s*>)", re.IGNORECASE | re.DOTALL)
         time_idx = 0
 
         def replace_time(m):

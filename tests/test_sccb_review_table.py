@@ -117,6 +117,25 @@ class ForceUpdateHeadingDatesTests(unittest.TestCase):
         # 표 안의 날짜는 유지된다
         self.assertIn("<td><p>2026. 7. 6.</p></td>", result)
 
+    def test_self_closing_native_time_elements_are_overwritten(self):
+        # Confluence 기본 Date 인라인 요소는 표시 텍스트 없이 self-closing으로 저장된다
+        body = (
+            "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body>"
+            "<h1>사전SCCB 검토 의견 "
+            '<time datetime="2026-07-06"/> ~ '
+            '<time datetime="2026-07-12"/>'
+            "</h1>"
+            "</ac:rich-text-body></ac:structured-macro>"
+            "<table><tbody><tr><td><p>이슈 희망일: 2026-07-06</p></td></tr></tbody></table>"
+        )
+        result = JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END)
+        self.assertIn('<time datetime="2026-07-13"/>', result)
+        self.assertIn('<time datetime="2026-07-19"/>', result)
+        self.assertNotIn('datetime="2026-07-06"', result)
+        self.assertNotIn('datetime="2026-07-12"', result)
+        # 표 안의 날짜는 건드리지 않는다
+        self.assertIn("이슈 희망일: 2026-07-06", result)
+
     def test_plain_text_range_is_overwritten_when_no_macro(self):
         body = "<p>사전SCCB 검토 의견 2026. 7. 6. ~ 2026. 7. 12.</p><table><tbody></tbody></table>"
         result = JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END)
