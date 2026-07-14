@@ -308,10 +308,14 @@ class TransitionWorkflow:
         to_name = (t_to_approval.get("to") or {}).get("name") or "Approval"
         self.log(f"{issue_key}: {cur} -> {to_name}")
 
-        # 반영 확인 (최대 6초)
+        # 반영 확인 (최대 6초) - 일시적 조회 오류는 무시하고 재시도
         for _ in range(10):
             time.sleep(0.6)
-            if self.jira.get_issue_status(issue_key).strip().lower() in ("approval", "approver"):
+            try:
+                st = self.jira.get_issue_status(issue_key).strip().lower()
+            except Exception:
+                continue
+            if st in ("approval", "approver"):
                 self.log(f"{issue_key}: Approval 반영 확인 완료")
                 return
         self.log(f"{issue_key}: Approval 반영 확인 실패 (Jira에서 직접 확인 필요)")
@@ -335,14 +339,18 @@ class TransitionWorkflow:
             ok = False
             for _ in range(10):
                 time.sleep(0.6)
-                if self.jira.get_issue_status(issue_key).strip().lower() in ("approval", "approver"):
+                try:
+                    st = self.jira.get_issue_status(issue_key).strip().lower()
+                except Exception:
+                    continue
+                if st in ("approval", "approver"):
                     ok = True
                     break
             if not ok:
                 self.log(f"{issue_key}: Approval 반영 확인 실패")
                 return
 
-            cur_l = self.jira.get_issue_status(issue_key).strip().lower()
+            cur_l = st
 
         if cur_l in ("approval", "approver"):
             trans = self.jira.get_transitions(issue_key)

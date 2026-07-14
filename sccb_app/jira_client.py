@@ -212,7 +212,15 @@ class JiraClient:
             headers={"Accept": "application/json"},
         )
         r.raise_for_status()
-        return r.json()
+        # 서버/프록시가 간헐적으로 200 + 빈 본문을 돌려주는 경우가 있어 방어
+        if not (r.text or "").strip():
+            return {}
+        try:
+            return r.json()
+        except ValueError:
+            raise RuntimeError(
+                f"JSON이 아닌 응답 수신 (HTTP {r.status_code}, {path}): {r.text[:200]!r}"
+            )
 
     def post(self, path: str, json_body: dict, headers: dict | None = None):
         url = f"{self.base_url}{path}"
