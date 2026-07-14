@@ -1,5 +1,6 @@
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,58 @@ REFERENCE_VIEW_THREE_ROWS = REFERENCE_VIEW.replace(
     "</tr>"
     "</tbody></table>",
 )
+
+
+class ForceUpdateHeadingDatesTests(unittest.TestCase):
+    NEW_START = date(2026, 7, 13)
+    NEW_END = date(2026, 7, 19)
+
+    def test_storage_date_macros_are_overwritten_even_when_dates_mismatch_title(self):
+        # 제목 옆 날짜가 제목 주차(7/6~7/12)와 어긋나게 저장된 경우
+        body = (
+            "<h1>사전SCCB 검토 의견 "
+            '<ac:structured-macro ac:name="handy-date" ac:schema-version="1">'
+            '<ac:parameter ac:name="date">2026-07-01</ac:parameter>'
+            "</ac:structured-macro> ~ "
+            '<ac:structured-macro ac:name="handy-date" ac:schema-version="1">'
+            '<ac:parameter ac:name="date">2026-07-07</ac:parameter>'
+            "</ac:structured-macro></h1>"
+            "<table><tbody><tr><td><p>이슈 희망일: 2026-07-01</p></td></tr></tbody></table>"
+        )
+        result = JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END)
+        self.assertIn('<ac:parameter ac:name="date">2026-07-13</ac:parameter>', result)
+        self.assertIn('<ac:parameter ac:name="date">2026-07-19</ac:parameter>', result)
+        # 표 안의 날짜는 건드리지 않는다
+        self.assertIn("이슈 희망일: 2026-07-01", result)
+
+    def test_rendered_time_elements_are_overwritten_in_order(self):
+        body = (
+            "<h1>사전SCCB 검토 의견 "
+            '<time datetime="2026-07-06" class="date-past handy-date-time">'
+            '<span class="handy-date-value">2026. 7. 6.</span></time> ~ '
+            '<time datetime="2026-07-12" class="date-upcoming handy-date-time">'
+            '<span class="handy-date-value">2026. 7. 12.</span></time></h1>'
+            "<table><tbody><tr><td><p>2026. 7. 6.</p></td></tr></tbody></table>"
+        )
+        result = JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END)
+        self.assertIn('datetime="2026-07-13"', result)
+        self.assertIn('datetime="2026-07-19"', result)
+        self.assertIn('handy-date-value">2026. 7. 13.</span>', result)
+        self.assertIn('handy-date-value">2026. 7. 19.</span>', result)
+        # 표 안의 날짜는 유지된다
+        self.assertIn("<td><p>2026. 7. 6.</p></td>", result)
+
+    def test_plain_text_range_is_overwritten_when_no_macro(self):
+        body = "<p>사전SCCB 검토 의견 2026. 7. 6. ~ 2026. 7. 12.</p><table><tbody></tbody></table>"
+        result = JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END)
+        self.assertIn("사전SCCB 검토 의견 2026. 7. 13. ~ 2026. 7. 19.", result)
+
+    def test_body_without_marker_is_unchanged(self):
+        body = "<p>다른 제목 2026. 7. 6. ~ 2026. 7. 12.</p>"
+        self.assertEqual(
+            body,
+            JiraClient._force_update_sccb_review_heading_dates(body, self.NEW_START, self.NEW_END),
+        )
 
 
 class ExtractReferenceJiraRowsTests(unittest.TestCase):

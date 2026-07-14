@@ -2762,6 +2762,88 @@ class JiraClient:
         return int(m.group(1)) if m else 1
 
     @classmethod
+    def _force_update_sccb_review_heading_dates(cls, body: str, new_start, new_end) -> str:
+        """'사전SCCB 검토 의견' 제목 오른쪽의 날짜 2개를 새 주간 범위로 강제 갱신한다.
+
+        기존 날짜 치환은 원본 제목의 주차 범위와 정확히 일치하는 날짜만 바꾸므로,
+        원본 페이지의 제목 옆 날짜가 주차 범위와 어긋나 있으면 옛 날짜가 그대로
+        남는다. 여기서는 제목~표 사이 구간에 있는 날짜 매크로/표시 텍스트를
+        순서대로(첫 번째=시작일, 두 번째=종료일) 새 값으로 덮어쓴다. 표 안의
+        이슈 일정 등 구간 밖 날짜는 건드리지 않는다.
+        """
+        text = body or ""
+        pos = -1
+        for marker in cls._SCCB_REVIEW_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                break
+        if pos < 0:
+            return body
+        table_m = re.search(r"<table\b", text[pos:], re.IGNORECASE)
+        region_end = pos + (table_m.start() if table_m else min(len(text) - pos, 4000))
+        region = text[pos:region_end]
+
+        new_dates = (new_start, new_end)
+
+        def iso(d):
+            return d.strftime("%Y-%m-%d")
+
+        def disp(d):
+            return f"{d.year}. {d.month}. {d.day}."
+
+        display_date_pat = re.compile(r"\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?")
+
+        # 1) Storage 형식: 날짜 매크로(ac:name에 date 포함)를 순서대로 덮어쓴다
+        macro_pat = re.compile(
+            r"<ac:structured-macro\b(?=[^>]*\bac:name\s*=\s*['\"][^'\"]*date[^'\"]*['\"])"
+            r"[^>]*>.*?</ac:structured-macro>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        macro_idx = 0
+
+        def replace_macro(m):
+            nonlocal macro_idx
+            if macro_idx >= 2:
+                return m.group(0)
+            d = new_dates[macro_idx]
+            macro_idx += 1
+            out = re.sub(r"\d{4}-\d{2}-\d{2}", iso(d), m.group(0))
+            return display_date_pat.sub(disp(d), out)
+
+        region = macro_pat.sub(replace_macro, region)
+
+        # 2) 화면 HTML 형식: <time datetime=...> 요소를 순서대로 덮어쓴다
+        time_pat = re.compile(r"<time\b[^>]*>.*?</time>", re.IGNORECASE | re.DOTALL)
+        time_idx = 0
+
+        def replace_time(m):
+            nonlocal time_idx
+            if time_idx >= 2:
+                return m.group(0)
+            d = new_dates[time_idx]
+            time_idx += 1
+            out = re.sub(
+                r"(datetime\s*=\s*['\"])\d{4}-\d{2}-\d{2}(['\"])",
+                rf"\g<1>{iso(d)}\g<2>",
+                m.group(0),
+                flags=re.IGNORECASE,
+            )
+            return display_date_pat.sub(disp(d), out)
+
+        region = time_pat.sub(replace_time, region)
+
+        # 3) 매크로/HTML 요소가 없으면 일반 텍스트 날짜 범위를 덮어쓴다
+        if macro_idx == 0 and time_idx == 0:
+            range_pat = re.compile(
+                r"(?:\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?|\d{4}-\d{2}-\d{2})"
+                r"\s*~\s*"
+                r"(?:\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?|\d{4}-\d{2}-\d{2})"
+            )
+            region = range_pat.sub(f"{disp(new_start)} ~ {disp(new_end)}", region, count=1)
+
+        return text[:pos] + region + text[region_end:]
+
+    @classmethod
     def _find_sccb_review_table_span(cls, body: str):
         """'사전SCCB 검토 의견' 마커 다음에 오는 첫 <table> 구간을 찾는다."""
         text = body or ""
@@ -3024,6 +3106,12 @@ class JiraClient:
             old_end=week_info["end"],
             new_start=week_info["next_start"],
             new_end=week_info["next_end"],
+        )
+
+        # '사전SCCB 검토 의견' 제목 옆 날짜 2개는 원본 값이 제목 주차와 어긋나
+        # 있어도 항상 새 주 범위(월~일)가 되도록 강제 갱신한다.
+        cloned_body = self._force_update_sccb_review_heading_dates(
+            cloned_body, week_info["next_start"], week_info["next_end"]
         )
 
         # 검토 의견 표를 새 주차 기준으로 초기화한다: 표 구조와 # 번호는 유지,
