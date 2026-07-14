@@ -3,6 +3,8 @@ import random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import requests
+
 TZ = ZoneInfo("Asia/Seoul")
 
 def norm_field_name(s: str) -> str:
@@ -14,6 +16,26 @@ class TransitionWorkflow:
         self.jira = jira_client
         self.log = log_fn
         self.get_mode = sccb_mode_getter  # "target" / "not_target"
+        # 프로젝트별 전이 권한 캐시 (True/False, 미확인 프로젝트는 키 없음)
+        self._transition_perm_by_project = {}
+
+    @staticmethod
+    def _project_key(issue_key: str) -> str:
+        return (issue_key or "").split("-")[0].upper()
+
+    def _log_if_no_transition_permission(self, issue_key: str) -> bool:
+        """전이 권한이 없으면 어떤 프로젝트인지 로그를 남기고 True를 반환한다."""
+        project = self._project_key(issue_key)
+        if project in self._transition_perm_by_project:
+            has_perm = self._transition_perm_by_project[project]
+        else:
+            has_perm = self.jira.has_transition_permission(issue_key)
+            if has_perm is not None:
+                self._transition_perm_by_project[project] = has_perm
+        if has_perm is False:
+            self.log(f"{issue_key}: 권한 없음 - '{project}' 프로젝트에 상태 전이(Transition Issues) 권한이 없습니다")
+            return True
+        return False
 
     def _debug_print_transitions(self, issue_key, transitions):
         for t in transitions:
@@ -203,7 +225,15 @@ class TransitionWorkflow:
         if extra_fields:
             payload.setdefault("fields", {})
             payload["fields"].update(extra_fields)
-        self.jira.do_transition(issue_key, payload)
+        try:
+            self.jira.do_transition(issue_key, payload)
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (401, 403):
+                project = self._project_key(issue_key)
+                self._transition_perm_by_project[project] = False
+                self.log(f"{issue_key}: 권한 없음 - '{project}' 프로젝트에 상태 전이 권한이 없습니다 (HTTP {status})")
+            raise
 
     def process_voc_linked_issues_from_parent(self, parent_issue_key: str):
         voc_keys = self.jira.get_linked_sw_voc_keys(parent_issue_key)
@@ -232,7 +262,8 @@ class TransitionWorkflow:
             or self._find_transition_to_done_category(trans)
         )
         if not t_done:
-            self.log(f"{parent_issue_key} -> {voc_key}: Done 전이 없음 (현재={cur})")
+            if not self._log_if_no_transition_permission(voc_key):
+                self.log(f"{parent_issue_key} -> {voc_key}: Done 전이 없음 (현재={cur})")
             return
 
         voc_start_date, voc_end_date, voc_diff_days = self._voc_start_end_date_policy()
@@ -301,17 +332,22 @@ class TransitionWorkflow:
             or self._find_transition_by_name(trans, "approver")
         )
         if not t_to_approval:
-            self.log(f"{issue_key}: Approval/Approver 전이 없음 (현재={cur})")
+            if not self._log_if_no_transition_permission(issue_key):
+                self.log(f"{issue_key}: Approval/Approver 전이 없음 (현재={cur})")
             return
 
         self._do_transition(issue_key, t_to_approval)
         to_name = (t_to_approval.get("to") or {}).get("name") or "Approval"
         self.log(f"{issue_key}: {cur} -> {to_name}")
 
-        # 반영 확인 (최대 6초)
+        # 반영 확인 (최대 6초) - 일시적 조회 오류는 무시하고 재시도
         for _ in range(10):
             time.sleep(0.6)
-            if self.jira.get_issue_status(issue_key).strip().lower() in ("approval", "approver"):
+            try:
+                st = self.jira.get_issue_status(issue_key).strip().lower()
+            except Exception:
+                continue
+            if st in ("approval", "approver"):
                 self.log(f"{issue_key}: Approval 반영 확인 완료")
                 return
         self.log(f"{issue_key}: Approval 반영 확인 실패 (Jira에서 직접 확인 필요)")
@@ -326,7 +362,8 @@ class TransitionWorkflow:
 
             t_to_approval = self._find_transition_to_status(trans, "Approval") or self._find_transition_to_status(trans, "Approver")
             if not t_to_approval:
-                self.log(f"{issue_key}: Approval/Approver 전이 없음 (현재=In Verification)")
+                if not self._log_if_no_transition_permission(issue_key):
+                    self.log(f"{issue_key}: Approval/Approver 전이 없음 (현재=In Verification)")
                 return
 
             self._do_transition(issue_key, t_to_approval)
@@ -335,14 +372,18 @@ class TransitionWorkflow:
             ok = False
             for _ in range(10):
                 time.sleep(0.6)
-                if self.jira.get_issue_status(issue_key).strip().lower() in ("approval", "approver"):
+                try:
+                    st = self.jira.get_issue_status(issue_key).strip().lower()
+                except Exception:
+                    continue
+                if st in ("approval", "approver"):
                     ok = True
                     break
             if not ok:
                 self.log(f"{issue_key}: Approval 반영 확인 실패")
                 return
 
-            cur_l = self.jira.get_issue_status(issue_key).strip().lower()
+            cur_l = st
 
         if cur_l in ("approval", "approver"):
             trans = self.jira.get_transitions(issue_key)
@@ -350,7 +391,8 @@ class TransitionWorkflow:
 
             t_to_complete = self._find_transition_to_status(trans, "Complete") or self._find_transition_to_done_category(trans)
             if not t_to_complete:
-                self.log(f"{issue_key}: Complete(또는 Done 카테고리) 전이 없음 (현재=Approval)")
+                if not self._log_if_no_transition_permission(issue_key):
+                    self.log(f"{issue_key}: Complete(또는 Done 카테고리) 전이 없음 (현재=Approval)")
                 return
 
             extra_fields = {}

@@ -212,7 +212,15 @@ class JiraClient:
             headers={"Accept": "application/json"},
         )
         r.raise_for_status()
-        return r.json()
+        # 서버/프록시가 간헐적으로 200 + 빈 본문을 돌려주는 경우가 있어 방어
+        if not (r.text or "").strip():
+            return {}
+        try:
+            return r.json()
+        except ValueError:
+            raise RuntimeError(
+                f"JSON이 아닌 응답 수신 (HTTP {r.status_code}, {path}): {r.text[:200]!r}"
+            )
 
     def post(self, path: str, json_body: dict, headers: dict | None = None):
         url = f"{self.base_url}{path}"
@@ -3404,6 +3412,23 @@ class JiraClient:
     def get_transitions(self, issue_key: str):
         data = self.get(f"/rest/api/2/issue/{issue_key}/transitions", params={"expand": "transitions.fields"})
         return data.get("transitions", []) or []
+
+    def has_transition_permission(self, issue_key: str):
+        """이슈에 대한 상태 전이(Transition Issues) 권한 보유 여부.
+
+        True/False를 반환하고, 권한 정보를 확인할 수 없으면 None을 반환한다.
+        """
+        try:
+            data = self.get("/rest/api/2/mypermissions", params={"issueKey": issue_key})
+        except Exception:
+            return None
+        perms = data.get("permissions") or {}
+        # Jira 버전에 따라 권한 키가 다름 (신규: TRANSITION_ISSUES, 구버전: TRANSITION_ISSUE)
+        for key in ("TRANSITION_ISSUES", "TRANSITION_ISSUE"):
+            p = perms.get(key)
+            if isinstance(p, dict) and "havePermission" in p:
+                return bool(p.get("havePermission"))
+        return None
 
     def do_transition(self, issue_key: str, payload: dict):
         self.post(f"/rest/api/2/issue/{issue_key}/transitions", payload)
