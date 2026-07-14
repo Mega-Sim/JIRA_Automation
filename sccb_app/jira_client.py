@@ -2738,6 +2738,336 @@ class JiraClient:
             payload,
         ) or {}
 
+    # ---- '사전SCCB 검토 의견' 표 편집 ----
+    _SCCB_REVIEW_MARKERS = ("사전SCCB 검토 의견", "사전 SCCB 검토 의견")
+    _REFERENCE_JIRA_MARKERS = ("참조 지라 이슈 티켓", "참조 지라 이슈티켓", "참조지라이슈티켓")
+    _TABLE_RE = re.compile(r"<table\b[\s\S]*?</table\s*>", re.IGNORECASE)
+    _TR_RE = re.compile(r"<tr\b[^>]*>[\s\S]*?</tr\s*>", re.IGNORECASE)
+    _CELL_RE = re.compile(r"<(th|td)\b([^>]*)>([\s\S]*?)</\1\s*>", re.IGNORECASE)
+    _ISSUE_KEY_TEXT_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+    @staticmethod
+    def _html_to_text(fragment: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", fragment or "")
+        text = _html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _norm_table_header(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "")).lower()
+
+    @staticmethod
+    def _int_html_attr(attrs: str, name: str) -> int:
+        m = re.search(rf"\b{name}\s*=\s*[\"']?(\d+)", attrs or "", re.IGNORECASE)
+        return int(m.group(1)) if m else 1
+
+    @classmethod
+    def _force_update_sccb_review_heading_dates(cls, body: str, new_start, new_end) -> str:
+        """'사전SCCB 검토 의견' 제목 오른쪽의 날짜 2개를 새 주간 범위로 강제 갱신한다.
+
+        기존 날짜 치환은 원본 제목의 주차 범위와 정확히 일치하는 날짜만 바꾸므로,
+        원본 페이지의 제목 옆 날짜가 주차 범위와 어긋나 있으면 옛 날짜가 그대로
+        남는다. 여기서는 제목~표 사이 구간에 있는 날짜 매크로/표시 텍스트를
+        순서대로(첫 번째=시작일, 두 번째=종료일) 새 값으로 덮어쓴다. 표 안의
+        이슈 일정 등 구간 밖 날짜는 건드리지 않는다.
+        """
+        text = body or ""
+        pos = -1
+        for marker in cls._SCCB_REVIEW_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                break
+        if pos < 0:
+            return body
+        table_m = re.search(r"<table\b", text[pos:], re.IGNORECASE)
+        region_end = pos + (table_m.start() if table_m else min(len(text) - pos, 4000))
+        region = text[pos:region_end]
+
+        new_dates = (new_start, new_end)
+
+        def iso(d):
+            return d.strftime("%Y-%m-%d")
+
+        def disp(d):
+            return f"{d.year}. {d.month}. {d.day}."
+
+        display_date_pat = re.compile(r"\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?")
+
+        # 1) Storage 형식: 날짜 매크로(ac:name에 date 포함)를 순서대로 덮어쓴다
+        macro_pat = re.compile(
+            r"<ac:structured-macro\b(?=[^>]*\bac:name\s*=\s*['\"][^'\"]*date[^'\"]*['\"])"
+            r"[^>]*>.*?</ac:structured-macro>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        macro_idx = 0
+
+        def replace_macro(m):
+            nonlocal macro_idx
+            if macro_idx >= 2:
+                return m.group(0)
+            d = new_dates[macro_idx]
+            macro_idx += 1
+            out = re.sub(r"\d{4}-\d{2}-\d{2}", iso(d), m.group(0))
+            return display_date_pat.sub(disp(d), out)
+
+        region = macro_pat.sub(replace_macro, region)
+
+        # 2) <time> 요소를 순서대로 덮어쓴다. Confluence 기본 Date 인라인 요소는
+        #    ``<time datetime="2026-07-06"/>``처럼 표시 텍스트 없이 self-closing으로
+        #    저장되고(화면에서 날짜를 자체 렌더링), Handy Date 등 일부 매크로는
+        #    ``<time ...>2026. 7. 6.</time>``처럼 닫는 태그와 표시 텍스트를 갖는다.
+        #    두 형태를 모두 지원한다.
+        time_pat = re.compile(r"<time\b[^>]*?(?:/>|>.*?</time\s*>)", re.IGNORECASE | re.DOTALL)
+        time_idx = 0
+
+        def replace_time(m):
+            nonlocal time_idx
+            if time_idx >= 2:
+                return m.group(0)
+            d = new_dates[time_idx]
+            time_idx += 1
+            out = re.sub(
+                r"(datetime\s*=\s*['\"])\d{4}-\d{2}-\d{2}(['\"])",
+                rf"\g<1>{iso(d)}\g<2>",
+                m.group(0),
+                flags=re.IGNORECASE,
+            )
+            return display_date_pat.sub(disp(d), out)
+
+        region = time_pat.sub(replace_time, region)
+
+        # 3) 매크로/HTML 요소가 없으면 일반 텍스트 날짜 범위를 덮어쓴다
+        if macro_idx == 0 and time_idx == 0:
+            range_pat = re.compile(
+                r"(?:\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?|\d{4}-\d{2}-\d{2})"
+                r"\s*~\s*"
+                r"(?:\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?|\d{4}-\d{2}-\d{2})"
+            )
+            region = range_pat.sub(f"{disp(new_start)} ~ {disp(new_end)}", region, count=1)
+
+        return text[:pos] + region + text[region_end:]
+
+    @classmethod
+    def _find_sccb_review_table_span(cls, body: str):
+        """'사전SCCB 검토 의견' 마커 다음에 오는 첫 <table> 구간을 찾는다."""
+        text = body or ""
+        for marker in cls._SCCB_REVIEW_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                m = cls._TABLE_RE.search(text, pos)
+                if m:
+                    return m.start(), m.end()
+        return None
+
+    @classmethod
+    def _parse_confluence_table_rows(cls, table_html: str) -> list[dict]:
+        """<table> 조각을 행/셀로 파싱하고 colspan/rowspan을 반영한 열 좌표를 계산한다.
+
+        행 dict: span(<tr> 구간), html, has_th, cells.
+        셀 dict: tag, attrs, inner, span(행 내 구간), cols(점유한 열 번호 목록).
+        """
+        rows = []
+        blocked = {}  # 열 번호 -> 위 행 rowspan이 이후 몇 개 행을 더 점유하는지
+        for tr_m in cls._TR_RE.finditer(table_html):
+            tr_html = tr_m.group(0)
+            cells = []
+            new_blocks = {}
+            col = 0
+            for cell_m in cls._CELL_RE.finditer(tr_html):
+                while blocked.get(col, 0) > 0:
+                    col += 1
+                attrs = cell_m.group(2) or ""
+                colspan = cls._int_html_attr(attrs, "colspan")
+                rowspan = cls._int_html_attr(attrs, "rowspan")
+                cols = list(range(col, col + colspan))
+                cells.append({
+                    "tag": cell_m.group(1).lower(),
+                    "attrs": attrs,
+                    "inner": cell_m.group(3),
+                    "span": cell_m.span(),
+                    "cols": cols,
+                })
+                if rowspan > 1:
+                    for c in cols:
+                        new_blocks[c] = max(new_blocks.get(c, 0), rowspan - 1)
+                col += colspan
+            rows.append({
+                "span": tr_m.span(),
+                "html": tr_html,
+                "has_th": any(c["tag"] == "th" for c in cells),
+                "cells": cells,
+            })
+            merged = {c: r - 1 for c, r in blocked.items() if r - 1 > 0}
+            for c, r in new_blocks.items():
+                merged[c] = max(merged.get(c, 0), r)
+            blocked = merged
+        return rows
+
+    @classmethod
+    def _extract_reference_jira_issue_rows(cls, view_html: str) -> list[dict]:
+        """body.view에서 '참조 지라 이슈 티켓' 매크로가 렌더링한 표의 데이터 행을 읽는다.
+
+        행마다 {정규화된 헤더: 셀 텍스트} dict를 반환한다 (dict 순서 = 열 순서).
+        매크로/표/데이터 행이 없으면 빈 리스트를 반환한다.
+        """
+        text = view_html or ""
+        pos = -1
+        for marker in cls._REFERENCE_JIRA_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                break
+        if pos < 0:
+            return []
+        m = cls._TABLE_RE.search(text, pos)
+        if not m:
+            return []
+
+        header_cols = {}
+        data = []
+        for row in cls._parse_confluence_table_rows(m.group(0)):
+            if not row["cells"]:
+                continue
+            if row["has_th"] or not header_cols:
+                for cell in row["cells"]:
+                    name = cls._norm_table_header(cls._html_to_text(cell["inner"]))
+                    for c in cell["cols"]:
+                        header_cols[c] = name
+                continue
+            rec = {}
+            for cell in row["cells"]:
+                key = header_cols.get(cell["cols"][0]) or f"col{cell['cols'][0]}"
+                rec[key] = cls._html_to_text(cell["inner"])
+            if any(rec.values()):
+                data.append(rec)
+        return data
+
+    @staticmethod
+    def _pick_reference_value(rec: dict, values: list, header_name: str, fallback_index: int) -> str:
+        """대상 열 이름과 같은/비슷한 매크로 열 값을 찾고, 없으면 같은 순서의 열 값을 쓴다."""
+        if header_name:
+            if header_name in rec:
+                return rec[header_name]
+            for k, v in rec.items():
+                if k and (header_name in k or k in header_name):
+                    return v
+        if 0 <= fallback_index < len(values):
+            return values[fallback_index]
+        return ""
+
+    def _refresh_sccb_review_table(self, body: str, ref_rows: list[dict]) -> str:
+        """'사전SCCB 검토 의견' 표의 데이터 행을 새 주차 기준으로 초기화한다.
+
+        표 구조와 1열(# 번호)은 그대로 두고 2열('유형')부터 끝 열까지 내용을 모두
+        지운 뒤, '참조 지라 이슈 티켓'의 In-Verification 이슈가 있으면 위에서부터
+        '유형'~'Hot Fix' 열에 채운다. 이슈가 기존 행 수보다 많으면 번호를 이어서
+        행을 추가하고, 이슈가 없으면 빈 표(빈 행)로 남긴다. 담당자는 '/' 뒤 영문
+        이름을 제외하고, 유관 부서 변경 부분/반영여부 열은 빈 칸으로 둔다.
+        """
+        span = self._find_sccb_review_table_span(body)
+        if not span:
+            return body
+        start, end = span
+        table = body[start:end]
+        rows = self._parse_confluence_table_rows(table)
+
+        col_name = {}
+        for row in rows:
+            if not row["has_th"]:
+                continue
+            for cell in row["cells"]:
+                name = self._norm_table_header(self._html_to_text(cell["inner"]))
+                if not name:
+                    continue
+                # 아래 헤더 행(세부 열)이 그룹 헤더를 덮어쓴다
+                for c in cell["cols"]:
+                    col_name[c] = name
+        if not col_name:
+            return body
+
+        def find_col(*candidates):
+            for c in sorted(col_name):
+                if any(cand == col_name[c] or cand in col_name[c] for cand in candidates):
+                    return c
+            return None
+
+        col_type = find_col("유형")
+        if col_type is None or col_type < 1:
+            return body
+        total_cols = max(cell["cols"][-1] + 1 for row in rows for cell in row["cells"])
+        col_hotfix = find_col("hotfix", "핫픽스")
+        if col_hotfix is None or col_hotfix < col_type:
+            col_hotfix = total_cols - 1
+        col_key = find_col("키")
+        col_assignee = find_col("담당자")
+
+        def issue_cell_inner(rec, values, c):
+            value = self._pick_reference_value(rec, values, col_name.get(c, ""), c - col_type)
+            if c == col_assignee:
+                value = value.split("/")[0].strip()
+            inner = _html.escape(value.strip())
+            if c == col_key and inner:
+                key_m = self._ISSUE_KEY_TEXT_RE.search(inner)
+                if key_m:
+                    key = key_m.group(1)
+                    inner = f'<a href="{self.base_url}/browse/{key}">{key}</a>'
+            return inner
+
+        data_rows = [r for r in rows if not r["has_th"] and r["cells"]]
+
+        # 기존 데이터 행: 1열(#)은 유지, '유형' 열부터는 지우고 이슈 내용으로 채운다
+        table_parts = []
+        last = 0
+        for i, row in enumerate(data_rows):
+            rec = ref_rows[i] if i < len(ref_rows) else None
+            values = list(rec.values()) if rec else []
+            row_parts = []
+            pos = 0
+            for cell in row["cells"]:
+                if cell["cols"][0] < col_type:
+                    continue
+                inner = ""
+                if rec is not None and col_type <= cell["cols"][0] <= col_hotfix:
+                    inner = issue_cell_inner(rec, values, cell["cols"][0])
+                c0, c1 = cell["span"]
+                row_parts.append(row["html"][pos:c0])
+                row_parts.append(
+                    f"<{cell['tag']}{cell['attrs']}>"
+                    f"{f'<p>{inner}</p>' if inner else '<p />'}"
+                    f"</{cell['tag']}>"
+                )
+                pos = c1
+            if not row_parts:
+                continue
+            row_parts.append(row["html"][pos:])
+            r0, r1 = row["span"]
+            table_parts.append(table[last:r0])
+            table_parts.append("".join(row_parts))
+            last = r1
+        table_parts.append(table[last:])
+        new_table = "".join(table_parts)
+
+        # 기존 행 수를 넘는 이슈는 번호를 이어 붙여 새 행으로 추가한다
+        extra_rows = []
+        for i in range(len(data_rows), len(ref_rows)):
+            rec = ref_rows[i]
+            values = list(rec.values())
+            cells = []
+            for c in range(total_cols):
+                inner = ""
+                if c == 0:
+                    inner = f"{i + 1:02d}"
+                elif col_type <= c <= col_hotfix:
+                    inner = issue_cell_inner(rec, values, c)
+                cells.append(f"<td><p>{inner}</p></td>" if inner else "<td><p /></td>")
+            extra_rows.append("<tr>" + "".join(cells) + "</tr>")
+        if extra_rows:
+            insert_at = new_table.lower().rfind("</tbody>")
+            if insert_at < 0:
+                insert_at = new_table.lower().rfind("</table>")
+            new_table = new_table[:insert_at] + "".join(extra_rows) + new_table[insert_at:]
+
+        return body[:start] + new_table + body[end:]
+
     def _clone_confluence_page_storage(
         self,
         conf_base: str,
@@ -2761,7 +3091,7 @@ class JiraClient:
         """
         source = self._get_json_absolute(
             f"{conf_base}/rest/api/content/{source_page_id}",
-            params={"expand": "body.storage,space,ancestors,_links"},
+            params={"expand": "body.storage,body.view,space,ancestors,_links"},
         ) or {}
 
         storage = (source.get("body") or {}).get("storage") or {}
@@ -2781,6 +3111,19 @@ class JiraClient:
             new_start=week_info["next_start"],
             new_end=week_info["next_end"],
         )
+
+        # '사전SCCB 검토 의견' 제목 옆 날짜 2개는 원본 값이 제목 주차와 어긋나
+        # 있어도 항상 새 주 범위(월~일)가 되도록 강제 갱신한다.
+        cloned_body = self._force_update_sccb_review_heading_dates(
+            cloned_body, week_info["next_start"], week_info["next_end"]
+        )
+
+        # 검토 의견 표를 새 주차 기준으로 초기화한다: 표 구조와 # 번호는 유지,
+        # '유형' 열부터는 지난 주 내용을 지우고, '참조 지라 이슈 티켓' 매크로의
+        # In-Verification 이슈가 있으면 채운다 (없으면 빈 표로 남긴다).
+        view_body = (((source.get("body") or {}).get("view") or {}).get("value")) or ""
+        reference_rows = self._extract_reference_jira_issue_rows(view_body)
+        cloned_body = self._refresh_sccb_review_table(cloned_body, reference_rows)
         representation = storage.get("representation") or "storage"
 
         payload = {
