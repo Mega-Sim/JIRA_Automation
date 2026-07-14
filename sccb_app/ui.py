@@ -200,12 +200,15 @@ class JiraSccbApp(tb.Window):
         # Tree 첫 컬럼(sel) 폭에 맞춰 배치
         self.select_all_chk.pack(side=LEFT, padx=(8, 0))
 
-        cols = ("sel", "key", "summary", "body_len", "rollout", "err_table", "links", "tcgen", "aio_test", "pr_merge", "status", "assignee", "duedate")
+        cols = ("sel", "key", "summary", "grade", "body_len", "rollout", "err_table", "links", "tcgen", "aio_test", "pr_merge", "status", "assignee", "duedate")
+        self._all_columns = cols
+        self._columns_without_grade = tuple(c for c in cols if c != "grade")
         self.tree = tb.Treeview(res, columns=cols, show="headings", height=16)
         for c, t in [
             ("sel", "선택"),
             ("key", "KEY"),
             ("summary", "SUMMARY"),
+            ("grade", "SCCB 등급"),
             ("body_len", "본문 길이"),
             ("rollout", "설계횡전개"),
             ("err_table", "연관 에러"),
@@ -227,6 +230,7 @@ class JiraSccbApp(tb.Window):
         self.tree.column("sel", width=42, minwidth=36, anchor=CENTER, stretch=False)
         self.tree.column("key", width=135, minwidth=100, stretch=False)
         self.tree.column("summary", width=170, minwidth=90, stretch=False)
+        self.tree.column("grade", width=76, minwidth=68, anchor=CENTER, stretch=False)
         self.tree.column("body_len", width=76, minwidth=70, anchor=CENTER, stretch=False)
         self.tree.column("rollout", width=84, minwidth=78, anchor=CENTER, stretch=False)
         self.tree.column("err_table", width=84, minwidth=78, anchor=CENTER, stretch=False)
@@ -237,6 +241,7 @@ class JiraSccbApp(tb.Window):
         self.tree.column("status", width=95, minwidth=88, stretch=False)
         self.tree.column("assignee", width=82, minwidth=72, stretch=False)
         self.tree.column("duedate", width=95, minwidth=92, anchor=CENTER, stretch=False)
+        self._update_grade_column_visibility()
 
         vsb = tb.Scrollbar(res, orient=VERTICAL, command=self.tree.yview)
         hsb = tb.Scrollbar(res, orient=HORIZONTAL, command=self.tree.xview)
@@ -457,14 +462,34 @@ class JiraSccbApp(tb.Window):
             # partial: leave unchecked
             self.select_all_var.set(0)
 
+    @classmethod
+    def _extract_select_field_text(cls, value) -> str:
+        """Select/Radio 등 커스텀 필드 값에서 표시용 텍스트를 뽑는다."""
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            return str(value.get("value") or value.get("name") or "").strip()
+        if isinstance(value, list):
+            return ", ".join(s for s in (cls._extract_select_field_text(v) for v in value) if s)
+        return str(value).strip()
+
+    def _update_grade_column_visibility(self):
+        """'SCCB 대상' 모드일 때만 'SCCB 등급' 열을 본문 길이 왼쪽에 노출한다."""
+        if self.sccb_mode == "target":
+            self.tree["displaycolumns"] = self._all_columns
+        else:
+            self.tree["displaycolumns"] = self._columns_without_grade
+
     def on_sccb_not_target(self):
         self.sccb_mode = "not_target"
         self.jql_var.set(JQL_SCCB_NOT_TARGET)
+        self._update_grade_column_visibility()
         self.on_search()
 
     def on_sccb_target(self):
         self.sccb_mode = "target"
         self.jql_var.set(JQL_SCCB_TARGET)
+        self._update_grade_column_visibility()
         self.on_search()
 
     def on_voc_complete(self):
@@ -473,6 +498,7 @@ class JiraSccbApp(tb.Window):
             Messagebox.show_warning("이번주 SCCB URL을 입력하세요.", title="경고")
             return
         self.sccb_mode = "voc_complete"
+        self._update_grade_column_visibility()
         self.on_search()
 
     def _create_next_week_page_from_url(
@@ -647,6 +673,7 @@ class JiraSccbApp(tb.Window):
                 weekly_url = (self.weekly_sccb_url_var.get() or "").strip()
                 weekly_keys = set()
                 data = None
+                grade_field_id = None
 
                 if self.sccb_mode == "voc_complete":
                     if not weekly_url:
@@ -684,7 +711,16 @@ class JiraSccbApp(tb.Window):
                     else:
                         self.weekly_sccb_keys = set()
 
-                    data = jira.search(self.jql_var.get(), self.max_results_var.get())
+                    if self.sccb_mode == "target":
+                        try:
+                            grade_field_id = jira.find_field_id("SCCB 등급")
+                        except Exception:
+                            grade_field_id = None
+                    data = jira.search(
+                        self.jql_var.get(),
+                        self.max_results_var.get(),
+                        extra_fields=[grade_field_id] if grade_field_id else None,
+                    )
 
                 issues = data.get("issues", [])
                 total = data.get("total", len(issues))
@@ -698,11 +734,13 @@ class JiraSccbApp(tb.Window):
                     body_len = "..."
                     rollout = "..."
                     links = "..."
+                    grade = self._extract_select_field_text(f.get(grade_field_id)) if grade_field_id else ""
 
                     self.selected[key] = False
                     self.issue_status[key] = st
                     iid = self.tree.insert("", END, values=(
                         "☐", key, f.get("summary", ""),
+                        grade,
                         body_len,
                         rollout,
                         "...",  # err_table placeholder
@@ -881,12 +919,12 @@ class JiraSccbApp(tb.Window):
         rows = []
         for iid in self.tree.get_children(""):
             v = self.tree.item(iid, "values")
-            if not v or len(v) < 12:
+            if not v or len(v) < 13:
                 continue
-            # v: sel,key,summary,body_len,rollout,err_table,links,tcgen,aio_test,pr_merge,status,assignee,duedate
-            sel, key, summary, body_len, rollout, err_table, links, tcgen, aio_test, pr_merge, status, assignee, duedate = v[:13]
+            # v: sel,key,summary,grade,body_len,rollout,err_table,links,tcgen,aio_test,pr_merge,status,assignee,duedate
+            sel, key, summary, grade, body_len, rollout, err_table, links, tcgen, aio_test, pr_merge, status, assignee, duedate = v[:14]
             result = self._calc_row_result(rollout, err_table, links, tcgen, aio_test, pr_merge)
-            rows.append([result, key, summary, body_len, rollout, err_table, links, tcgen, aio_test, pr_merge, status, assignee, duedate])
+            rows.append([result, key, summary, grade, body_len, rollout, err_table, links, tcgen, aio_test, pr_merge, status, assignee, duedate])
 
         if not rows:
             Messagebox.show_info("내보낼 데이터가 없습니다.", title="안내")
@@ -907,7 +945,7 @@ class JiraSccbApp(tb.Window):
         ws = wb.active
         ws.title = "Validation"
 
-        header = ["RESULT", "KEY", "SUMMARY", "본문 길이", "횡전개 표", "연관 에러", "이슈연결", "LLM TC 생성", "AIO Test", "P/R 병합", "STATUS", "ASSIGNEE", "기한일"]
+        header = ["RESULT", "KEY", "SUMMARY", "SCCB 등급", "본문 길이", "횡전개 표", "연관 에러", "이슈연결", "LLM TC 생성", "AIO Test", "P/R 병합", "STATUS", "ASSIGNEE", "기한일"]
         ws.append(header)
 
         # 헤더 스타일
@@ -935,7 +973,7 @@ class JiraSccbApp(tb.Window):
         ws.freeze_panes = "A2"
     
         # Column width (대략)
-        widths = [10, 16, 70, 12, 12, 12, 28, 12, 12, 10, 18, 18, 22]
+        widths = [10, 16, 70, 12, 12, 12, 12, 28, 12, 12, 10, 18, 18, 22]
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
 
