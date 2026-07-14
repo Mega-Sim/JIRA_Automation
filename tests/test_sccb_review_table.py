@@ -66,35 +66,15 @@ REFERENCE_VIEW = (
     "</tbody></table>"
 )
 
-
-class ClearReviewOpinionColumnsTests(unittest.TestCase):
-    def test_clears_opinion_columns_only_in_data_rows(self):
-        result = JiraClient._clear_sccb_review_opinion_columns(REVIEW_BODY)
-
-        # 데이터 행의 '유관 부서 변경 부분'/'반영여부' 열 텍스트는 지워진다
-        self.assertNotIn("특이점 없음", result)
-        self.assertNotIn("Task 자동으로 선택할 수 있는 정보나 센서가 없어서", result)
-        self.assertNotIn("<td><p>반영</p></td>", result)
-        # 헤더와 나머지 열(#~Hot Fix)은 그대로 유지된다
-        self.assertIn("유관 부서 변경 부분", result)
-        self.assertIn("반영여부", result)
-        self.assertIn("품질 담당자", result)
-        self.assertIn("AMVCS30-79", result)
-        self.assertIn("한지훈/Jihun Han", result)
-        self.assertIn("UI 기능 신규 추가", result)
-        self.assertIn("<td><p>NO</p></td>", result)
-
-    def test_body_without_review_table_is_unchanged(self):
-        body = "<p>사전SCCB 검토 의견</p><p>표 없음</p>"
-        self.assertEqual(body, JiraClient._clear_sccb_review_opinion_columns(body))
-
-    def test_table_without_opinion_headers_is_unchanged(self):
-        body = (
-            "<p>사전SCCB 검토 의견</p>"
-            '<table><tbody><tr><td colspan="2">'
-            '<ac:structured-macro ac:name="jira" /></td></tr></tbody></table>'
-        )
-        self.assertEqual(body, JiraClient._clear_sccb_review_opinion_columns(body))
+REFERENCE_VIEW_THREE_ROWS = REFERENCE_VIEW.replace(
+    "</tbody></table>",
+    "<tr>"
+    "<td>개선</td><td>AMOHTV70S-520</td>"
+    "<td>추가 이슈</td><td>박영희/Younghee Park</td>"
+    "<td>C</td><td>기타</td><td>NO</td>"
+    "</tr>"
+    "</tbody></table>",
+)
 
 
 class ExtractReferenceJiraRowsTests(unittest.TestCase):
@@ -115,18 +95,36 @@ class ExtractReferenceJiraRowsTests(unittest.TestCase):
         self.assertEqual([], JiraClient._extract_reference_jira_issue_rows(empty_macro))
 
 
-class FillReviewTableFromReferenceTests(unittest.TestCase):
-    def test_replaces_data_rows_with_reference_issues(self):
+class RefreshReviewTableTests(unittest.TestCase):
+    def test_no_reference_rows_clears_from_type_column_and_keeps_numbering(self):
         client = make_client()
-        rows = JiraClient._extract_reference_jira_issue_rows(REFERENCE_VIEW)
-        result = client._fill_sccb_review_table_from_reference(REVIEW_BODY, rows)
+        result = client._refresh_sccb_review_table(REVIEW_BODY, [])
 
-        # 기존 데이터 행은 교체된다
-        self.assertNotIn("AMVCS30-79", result)
-        self.assertNotIn("MapUpdate 이력 조회 기능", result)
-        # 새 행: 01부터 자동 번호, 유형~Hot Fix 열 채움
+        # 표 구조와 1열(# 번호)은 유지된다
         self.assertIn("<td><p>01</p></td>", result)
         self.assertIn("<td><p>02</p></td>", result)
+        self.assertIn("유관 부서 변경 부분", result)
+        self.assertIn("반영여부", result)
+        self.assertIn("품질 담당자", result)
+        # '유형' 열부터 끝 열까지 지난 주 내용은 모두 지워진다
+        self.assertNotIn("AMVCS30-79", result)
+        self.assertNotIn("MapUpdate 이력 조회 기능", result)
+        self.assertNotIn("한지훈", result)
+        self.assertNotIn("UI 기능 신규 추가", result)
+        self.assertNotIn("특이점 없음", result)
+        self.assertNotIn("Task 자동으로 선택할 수 있는 정보나 센서가 없어서", result)
+        self.assertNotIn("<td><p>반영</p></td>", result)
+        self.assertNotIn("<td><p>NO</p></td>", result)
+
+    def test_reference_rows_fill_existing_rows_in_place(self):
+        client = make_client()
+        rows = JiraClient._extract_reference_jira_issue_rows(REFERENCE_VIEW)
+        result = client._refresh_sccb_review_table(REVIEW_BODY, rows)
+
+        # 기존 행 자리(번호 유지)에 In-Verification 이슈가 채워진다
+        self.assertIn("<td><p>01</p></td>", result)
+        self.assertIn("<td><p>02</p></td>", result)
+        self.assertNotIn("AMVCS30-79", result)
         self.assertIn("설비 Data 취합에 대한 편의성 확보", result)
         self.assertIn("<td><p>YES</p></td>", result)
         # 키는 Jira 링크로 들어간다
@@ -136,14 +134,47 @@ class FillReviewTableFromReferenceTests(unittest.TestCase):
         self.assertIn("<td><p>김철수</p></td>", result)
         self.assertNotIn("Jaehyo", result)
         # 유관 부서 변경 부분/반영여부 열은 빈 칸으로 남는다
+        self.assertNotIn("특이점 없음", result)
         self.assertIn("<td><p /></td>", result)
-        # 헤더는 유지된다
-        self.assertIn("유관 부서 변경 부분", result)
-        self.assertIn("SCCB 등급 사유", result)
 
-    def test_no_reference_rows_leaves_body_unchanged(self):
+    def test_more_reference_rows_than_existing_appends_numbered_rows(self):
         client = make_client()
-        self.assertEqual(REVIEW_BODY, client._fill_sccb_review_table_from_reference(REVIEW_BODY, []))
+        rows = JiraClient._extract_reference_jira_issue_rows(REFERENCE_VIEW_THREE_ROWS)
+        self.assertEqual(3, len(rows))
+        result = client._refresh_sccb_review_table(REVIEW_BODY, rows)
+
+        # 기존 2행을 채우고, 3번째 이슈는 번호를 이어 새 행으로 추가된다
+        self.assertIn("<td><p>03</p></td>", result)
+        self.assertIn('<a href="https://jira.example.com/browse/AMOHTV70S-520">AMOHTV70S-520</a>', result)
+        self.assertIn("<td><p>박영희</p></td>", result)
+        self.assertNotIn("Younghee", result)
+
+    def test_fewer_reference_rows_leaves_remaining_rows_empty(self):
+        client = make_client()
+        rows = JiraClient._extract_reference_jira_issue_rows(REFERENCE_VIEW)[:1]
+        result = client._refresh_sccb_review_table(REVIEW_BODY, rows)
+
+        # 1행만 채워지고 2행은 번호만 남은 빈 행이 된다
+        self.assertIn("<td><p>01</p></td>", result)
+        self.assertIn("<td><p>02</p></td>", result)
+        self.assertIn("AMOHTV80F-2287", result)
+        self.assertNotIn("AMOHTV80F-2302", result)
+        self.assertNotIn("AMVCS30-76", result)
+        self.assertNotIn("VCS Task Step 변경", result)
+
+    def test_body_without_review_table_is_unchanged(self):
+        client = make_client()
+        body = "<p>사전SCCB 검토 의견</p><p>표 없음</p>"
+        self.assertEqual(body, client._refresh_sccb_review_table(body, []))
+
+    def test_table_without_headers_is_unchanged(self):
+        client = make_client()
+        body = (
+            "<p>사전SCCB 검토 의견</p>"
+            '<table><tbody><tr><td colspan="2">'
+            '<ac:structured-macro ac:name="jira" /></td></tr></tbody></table>'
+        )
+        self.assertEqual(body, client._refresh_sccb_review_table(body, []))
 
 
 if __name__ == "__main__":

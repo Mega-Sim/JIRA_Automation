@@ -2818,56 +2818,6 @@ class JiraClient:
         return rows
 
     @classmethod
-    def _clear_sccb_review_opinion_columns(cls, body: str) -> str:
-        """'사전SCCB 검토 의견' 표에서 검토 의견 열의 데이터 행 텍스트를 비운다.
-
-        복제 원본은 검토가 끝난 주라서 '유관 부서 변경 부분' 하위 열과 '반영여부'
-        열에 남은 의견(예: '특이점 없음')을 헤더 아래 데이터 행에서 모두 지운다.
-        """
-        span = cls._find_sccb_review_table_span(body)
-        if not span:
-            return body
-        start, end = span
-        table = body[start:end]
-        rows = cls._parse_confluence_table_rows(table)
-
-        target_cols = set()
-        for row in rows:
-            if not row["has_th"]:
-                continue
-            for cell in row["cells"]:
-                name = cls._norm_table_header(cls._html_to_text(cell["inner"]))
-                if "유관부서변경부분" in name or "반영여부" in name:
-                    target_cols.update(cell["cols"])
-        if not target_cols:
-            return body
-
-        table_parts = []
-        last = 0
-        for row in rows:
-            if row["has_th"] or not row["cells"]:
-                continue
-            row_parts = []
-            pos = 0
-            for cell in row["cells"]:
-                if set(cell["cols"]) & target_cols and cls._html_to_text(cell["inner"]):
-                    c0, c1 = cell["span"]
-                    row_parts.append(row["html"][pos:c0])
-                    row_parts.append(f"<{cell['tag']}{cell['attrs']}><p /></{cell['tag']}>")
-                    pos = c1
-            if not row_parts:
-                continue
-            row_parts.append(row["html"][pos:])
-            r0, r1 = row["span"]
-            table_parts.append(table[last:r0])
-            table_parts.append("".join(row_parts))
-            last = r1
-        if not table_parts:
-            return body
-        table_parts.append(table[last:])
-        return body[:start] + "".join(table_parts) + body[end:]
-
-    @classmethod
     def _extract_reference_jira_issue_rows(cls, view_html: str) -> list[dict]:
         """body.view에서 '참조 지라 이슈 티켓' 매크로가 렌더링한 표의 데이터 행을 읽는다.
 
@@ -2918,14 +2868,15 @@ class JiraClient:
             return values[fallback_index]
         return ""
 
-    def _fill_sccb_review_table_from_reference(self, body: str, ref_rows: list[dict]) -> str:
-        """'참조 지라 이슈 티켓'의 이슈 행으로 '사전SCCB 검토 의견' 표의 데이터 행을 교체한다.
+    def _refresh_sccb_review_table(self, body: str, ref_rows: list[dict]) -> str:
+        """'사전SCCB 검토 의견' 표의 데이터 행을 새 주차 기준으로 초기화한다.
 
-        1열(#)은 01부터 자동 번호를 붙이고 '유형'~'Hot Fix' 열만 채운다. 담당자는
-        '/' 뒤 영문 이름을 제외하고, 나머지 열(유관 부서 변경 부분 등)은 빈 칸으로 둔다.
+        표 구조와 1열(# 번호)은 그대로 두고 2열('유형')부터 끝 열까지 내용을 모두
+        지운 뒤, '참조 지라 이슈 티켓'의 In-Verification 이슈가 있으면 위에서부터
+        '유형'~'Hot Fix' 열에 채운다. 이슈가 기존 행 수보다 많으면 번호를 이어서
+        행을 추가하고, 이슈가 없으면 빈 표(빈 행)로 남긴다. 담당자는 '/' 뒤 영문
+        이름을 제외하고, 유관 부서 변경 부분/반영여부 열은 빈 칸으로 둔다.
         """
-        if not ref_rows:
-            return body
         span = self._find_sccb_review_table_span(body)
         if not span:
             return body
@@ -2954,46 +2905,81 @@ class JiraClient:
             return None
 
         col_type = find_col("유형")
-        col_hotfix = find_col("hotfix", "핫픽스")
-        if col_type is None or col_hotfix is None or col_hotfix < col_type:
+        if col_type is None or col_type < 1:
             return body
+        total_cols = max(cell["cols"][-1] + 1 for row in rows for cell in row["cells"])
+        col_hotfix = find_col("hotfix", "핫픽스")
+        if col_hotfix is None or col_hotfix < col_type:
+            col_hotfix = total_cols - 1
         col_key = find_col("키")
         col_assignee = find_col("담당자")
-        total_cols = max(
-            (cell["cols"][-1] + 1 for row in rows for cell in row["cells"]),
-            default=0,
-        )
 
-        new_rows = []
-        for no, rec in enumerate(ref_rows, start=1):
+        def issue_cell_inner(rec, values, c):
+            value = self._pick_reference_value(rec, values, col_name.get(c, ""), c - col_type)
+            if c == col_assignee:
+                value = value.split("/")[0].strip()
+            inner = _html.escape(value.strip())
+            if c == col_key and inner:
+                key_m = self._ISSUE_KEY_TEXT_RE.search(inner)
+                if key_m:
+                    key = key_m.group(1)
+                    inner = f'<a href="{self.base_url}/browse/{key}">{key}</a>'
+            return inner
+
+        data_rows = [r for r in rows if not r["has_th"] and r["cells"]]
+
+        # 기존 데이터 행: 1열(#)은 유지, '유형' 열부터는 지우고 이슈 내용으로 채운다
+        table_parts = []
+        last = 0
+        for i, row in enumerate(data_rows):
+            rec = ref_rows[i] if i < len(ref_rows) else None
+            values = list(rec.values()) if rec else []
+            row_parts = []
+            pos = 0
+            for cell in row["cells"]:
+                if cell["cols"][0] < col_type:
+                    continue
+                inner = ""
+                if rec is not None and col_type <= cell["cols"][0] <= col_hotfix:
+                    inner = issue_cell_inner(rec, values, cell["cols"][0])
+                c0, c1 = cell["span"]
+                row_parts.append(row["html"][pos:c0])
+                row_parts.append(
+                    f"<{cell['tag']}{cell['attrs']}>"
+                    f"{f'<p>{inner}</p>' if inner else '<p />'}"
+                    f"</{cell['tag']}>"
+                )
+                pos = c1
+            if not row_parts:
+                continue
+            row_parts.append(row["html"][pos:])
+            r0, r1 = row["span"]
+            table_parts.append(table[last:r0])
+            table_parts.append("".join(row_parts))
+            last = r1
+        table_parts.append(table[last:])
+        new_table = "".join(table_parts)
+
+        # 기존 행 수를 넘는 이슈는 번호를 이어 붙여 새 행으로 추가한다
+        extra_rows = []
+        for i in range(len(data_rows), len(ref_rows)):
+            rec = ref_rows[i]
             values = list(rec.values())
             cells = []
             for c in range(total_cols):
                 inner = ""
-                if c == 0 and col_type > 0:
-                    inner = f"{no:02d}"
+                if c == 0:
+                    inner = f"{i + 1:02d}"
                 elif col_type <= c <= col_hotfix:
-                    value = self._pick_reference_value(rec, values, col_name.get(c, ""), c - col_type)
-                    if c == col_assignee:
-                        value = value.split("/")[0].strip()
-                    inner = _html.escape(value.strip())
-                    if c == col_key:
-                        key_m = self._ISSUE_KEY_TEXT_RE.search(inner)
-                        if key_m:
-                            key = key_m.group(1)
-                            inner = f'<a href="{self.base_url}/browse/{key}">{key}</a>'
+                    inner = issue_cell_inner(rec, values, c)
                 cells.append(f"<td><p>{inner}</p></td>" if inner else "<td><p /></td>")
-            new_rows.append("<tr>" + "".join(cells) + "</tr>")
-        rows_html = "".join(new_rows)
-
-        data_rows = [r for r in rows if not r["has_th"] and r["cells"]]
-        if data_rows:
-            new_table = table[:data_rows[0]["span"][0]] + rows_html + table[data_rows[-1]["span"][1]:]
-        else:
-            insert_at = table.lower().rfind("</tbody>")
+            extra_rows.append("<tr>" + "".join(cells) + "</tr>")
+        if extra_rows:
+            insert_at = new_table.lower().rfind("</tbody>")
             if insert_at < 0:
-                insert_at = table.lower().rfind("</table>")
-            new_table = table[:insert_at] + rows_html + table[insert_at:]
+                insert_at = new_table.lower().rfind("</table>")
+            new_table = new_table[:insert_at] + "".join(extra_rows) + new_table[insert_at:]
+
         return body[:start] + new_table + body[end:]
 
     def _clone_confluence_page_storage(
@@ -3040,14 +3026,12 @@ class JiraClient:
             new_end=week_info["next_end"],
         )
 
-        # '참조 지라 이슈 티켓' 매크로에 In-Verification 이슈가 있으면, 검토 의견
-        # 표의 데이터 행을 해당 이슈들로 교체한다 (매크로가 비어 있으면 그대로 둔다).
+        # 검토 의견 표를 새 주차 기준으로 초기화한다: 표 구조와 # 번호는 유지,
+        # '유형' 열부터는 지난 주 내용을 지우고, '참조 지라 이슈 티켓' 매크로의
+        # In-Verification 이슈가 있으면 채운다 (없으면 빈 표로 남긴다).
         view_body = (((source.get("body") or {}).get("view") or {}).get("value")) or ""
         reference_rows = self._extract_reference_jira_issue_rows(view_body)
-        if reference_rows:
-            cloned_body = self._fill_sccb_review_table_from_reference(cloned_body, reference_rows)
-        # 원본에 남은 지난 주 검토 의견('유관 부서 변경 부분'/'반영여부' 열)은 비운다.
-        cloned_body = self._clear_sccb_review_opinion_columns(cloned_body)
+        cloned_body = self._refresh_sccb_review_table(cloned_body, reference_rows)
         representation = storage.get("representation") or "storage"
 
         payload = {
