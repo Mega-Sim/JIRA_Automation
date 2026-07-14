@@ -2738,6 +2738,264 @@ class JiraClient:
             payload,
         ) or {}
 
+    # ---- '사전SCCB 검토 의견' 표 편집 ----
+    _SCCB_REVIEW_MARKERS = ("사전SCCB 검토 의견", "사전 SCCB 검토 의견")
+    _REFERENCE_JIRA_MARKERS = ("참조 지라 이슈 티켓", "참조 지라 이슈티켓", "참조지라이슈티켓")
+    _TABLE_RE = re.compile(r"<table\b[\s\S]*?</table\s*>", re.IGNORECASE)
+    _TR_RE = re.compile(r"<tr\b[^>]*>[\s\S]*?</tr\s*>", re.IGNORECASE)
+    _CELL_RE = re.compile(r"<(th|td)\b([^>]*)>([\s\S]*?)</\1\s*>", re.IGNORECASE)
+    _ISSUE_KEY_TEXT_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
+    @staticmethod
+    def _html_to_text(fragment: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", fragment or "")
+        text = _html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _norm_table_header(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "")).lower()
+
+    @staticmethod
+    def _int_html_attr(attrs: str, name: str) -> int:
+        m = re.search(rf"\b{name}\s*=\s*[\"']?(\d+)", attrs or "", re.IGNORECASE)
+        return int(m.group(1)) if m else 1
+
+    @classmethod
+    def _find_sccb_review_table_span(cls, body: str):
+        """'사전SCCB 검토 의견' 마커 다음에 오는 첫 <table> 구간을 찾는다."""
+        text = body or ""
+        for marker in cls._SCCB_REVIEW_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                m = cls._TABLE_RE.search(text, pos)
+                if m:
+                    return m.start(), m.end()
+        return None
+
+    @classmethod
+    def _parse_confluence_table_rows(cls, table_html: str) -> list[dict]:
+        """<table> 조각을 행/셀로 파싱하고 colspan/rowspan을 반영한 열 좌표를 계산한다.
+
+        행 dict: span(<tr> 구간), html, has_th, cells.
+        셀 dict: tag, attrs, inner, span(행 내 구간), cols(점유한 열 번호 목록).
+        """
+        rows = []
+        blocked = {}  # 열 번호 -> 위 행 rowspan이 이후 몇 개 행을 더 점유하는지
+        for tr_m in cls._TR_RE.finditer(table_html):
+            tr_html = tr_m.group(0)
+            cells = []
+            new_blocks = {}
+            col = 0
+            for cell_m in cls._CELL_RE.finditer(tr_html):
+                while blocked.get(col, 0) > 0:
+                    col += 1
+                attrs = cell_m.group(2) or ""
+                colspan = cls._int_html_attr(attrs, "colspan")
+                rowspan = cls._int_html_attr(attrs, "rowspan")
+                cols = list(range(col, col + colspan))
+                cells.append({
+                    "tag": cell_m.group(1).lower(),
+                    "attrs": attrs,
+                    "inner": cell_m.group(3),
+                    "span": cell_m.span(),
+                    "cols": cols,
+                })
+                if rowspan > 1:
+                    for c in cols:
+                        new_blocks[c] = max(new_blocks.get(c, 0), rowspan - 1)
+                col += colspan
+            rows.append({
+                "span": tr_m.span(),
+                "html": tr_html,
+                "has_th": any(c["tag"] == "th" for c in cells),
+                "cells": cells,
+            })
+            merged = {c: r - 1 for c, r in blocked.items() if r - 1 > 0}
+            for c, r in new_blocks.items():
+                merged[c] = max(merged.get(c, 0), r)
+            blocked = merged
+        return rows
+
+    @classmethod
+    def _clear_sccb_review_opinion_columns(cls, body: str) -> str:
+        """'사전SCCB 검토 의견' 표에서 검토 의견 열의 데이터 행 텍스트를 비운다.
+
+        복제 원본은 검토가 끝난 주라서 '유관 부서 변경 부분' 하위 열과 '반영여부'
+        열에 남은 의견(예: '특이점 없음')을 헤더 아래 데이터 행에서 모두 지운다.
+        """
+        span = cls._find_sccb_review_table_span(body)
+        if not span:
+            return body
+        start, end = span
+        table = body[start:end]
+        rows = cls._parse_confluence_table_rows(table)
+
+        target_cols = set()
+        for row in rows:
+            if not row["has_th"]:
+                continue
+            for cell in row["cells"]:
+                name = cls._norm_table_header(cls._html_to_text(cell["inner"]))
+                if "유관부서변경부분" in name or "반영여부" in name:
+                    target_cols.update(cell["cols"])
+        if not target_cols:
+            return body
+
+        table_parts = []
+        last = 0
+        for row in rows:
+            if row["has_th"] or not row["cells"]:
+                continue
+            row_parts = []
+            pos = 0
+            for cell in row["cells"]:
+                if set(cell["cols"]) & target_cols and cls._html_to_text(cell["inner"]):
+                    c0, c1 = cell["span"]
+                    row_parts.append(row["html"][pos:c0])
+                    row_parts.append(f"<{cell['tag']}{cell['attrs']}><p /></{cell['tag']}>")
+                    pos = c1
+            if not row_parts:
+                continue
+            row_parts.append(row["html"][pos:])
+            r0, r1 = row["span"]
+            table_parts.append(table[last:r0])
+            table_parts.append("".join(row_parts))
+            last = r1
+        if not table_parts:
+            return body
+        table_parts.append(table[last:])
+        return body[:start] + "".join(table_parts) + body[end:]
+
+    @classmethod
+    def _extract_reference_jira_issue_rows(cls, view_html: str) -> list[dict]:
+        """body.view에서 '참조 지라 이슈 티켓' 매크로가 렌더링한 표의 데이터 행을 읽는다.
+
+        행마다 {정규화된 헤더: 셀 텍스트} dict를 반환한다 (dict 순서 = 열 순서).
+        매크로/표/데이터 행이 없으면 빈 리스트를 반환한다.
+        """
+        text = view_html or ""
+        pos = -1
+        for marker in cls._REFERENCE_JIRA_MARKERS:
+            pos = text.find(marker)
+            if pos >= 0:
+                break
+        if pos < 0:
+            return []
+        m = cls._TABLE_RE.search(text, pos)
+        if not m:
+            return []
+
+        header_cols = {}
+        data = []
+        for row in cls._parse_confluence_table_rows(m.group(0)):
+            if not row["cells"]:
+                continue
+            if row["has_th"] or not header_cols:
+                for cell in row["cells"]:
+                    name = cls._norm_table_header(cls._html_to_text(cell["inner"]))
+                    for c in cell["cols"]:
+                        header_cols[c] = name
+                continue
+            rec = {}
+            for cell in row["cells"]:
+                key = header_cols.get(cell["cols"][0]) or f"col{cell['cols'][0]}"
+                rec[key] = cls._html_to_text(cell["inner"])
+            if any(rec.values()):
+                data.append(rec)
+        return data
+
+    @staticmethod
+    def _pick_reference_value(rec: dict, values: list, header_name: str, fallback_index: int) -> str:
+        """대상 열 이름과 같은/비슷한 매크로 열 값을 찾고, 없으면 같은 순서의 열 값을 쓴다."""
+        if header_name:
+            if header_name in rec:
+                return rec[header_name]
+            for k, v in rec.items():
+                if k and (header_name in k or k in header_name):
+                    return v
+        if 0 <= fallback_index < len(values):
+            return values[fallback_index]
+        return ""
+
+    def _fill_sccb_review_table_from_reference(self, body: str, ref_rows: list[dict]) -> str:
+        """'참조 지라 이슈 티켓'의 이슈 행으로 '사전SCCB 검토 의견' 표의 데이터 행을 교체한다.
+
+        1열(#)은 01부터 자동 번호를 붙이고 '유형'~'Hot Fix' 열만 채운다. 담당자는
+        '/' 뒤 영문 이름을 제외하고, 나머지 열(유관 부서 변경 부분 등)은 빈 칸으로 둔다.
+        """
+        if not ref_rows:
+            return body
+        span = self._find_sccb_review_table_span(body)
+        if not span:
+            return body
+        start, end = span
+        table = body[start:end]
+        rows = self._parse_confluence_table_rows(table)
+
+        col_name = {}
+        for row in rows:
+            if not row["has_th"]:
+                continue
+            for cell in row["cells"]:
+                name = self._norm_table_header(self._html_to_text(cell["inner"]))
+                if not name:
+                    continue
+                # 아래 헤더 행(세부 열)이 그룹 헤더를 덮어쓴다
+                for c in cell["cols"]:
+                    col_name[c] = name
+        if not col_name:
+            return body
+
+        def find_col(*candidates):
+            for c in sorted(col_name):
+                if any(cand == col_name[c] or cand in col_name[c] for cand in candidates):
+                    return c
+            return None
+
+        col_type = find_col("유형")
+        col_hotfix = find_col("hotfix", "핫픽스")
+        if col_type is None or col_hotfix is None or col_hotfix < col_type:
+            return body
+        col_key = find_col("키")
+        col_assignee = find_col("담당자")
+        total_cols = max(
+            (cell["cols"][-1] + 1 for row in rows for cell in row["cells"]),
+            default=0,
+        )
+
+        new_rows = []
+        for no, rec in enumerate(ref_rows, start=1):
+            values = list(rec.values())
+            cells = []
+            for c in range(total_cols):
+                inner = ""
+                if c == 0 and col_type > 0:
+                    inner = f"{no:02d}"
+                elif col_type <= c <= col_hotfix:
+                    value = self._pick_reference_value(rec, values, col_name.get(c, ""), c - col_type)
+                    if c == col_assignee:
+                        value = value.split("/")[0].strip()
+                    inner = _html.escape(value.strip())
+                    if c == col_key:
+                        key_m = self._ISSUE_KEY_TEXT_RE.search(inner)
+                        if key_m:
+                            key = key_m.group(1)
+                            inner = f'<a href="{self.base_url}/browse/{key}">{key}</a>'
+                cells.append(f"<td><p>{inner}</p></td>" if inner else "<td><p /></td>")
+            new_rows.append("<tr>" + "".join(cells) + "</tr>")
+        rows_html = "".join(new_rows)
+
+        data_rows = [r for r in rows if not r["has_th"] and r["cells"]]
+        if data_rows:
+            new_table = table[:data_rows[0]["span"][0]] + rows_html + table[data_rows[-1]["span"][1]:]
+        else:
+            insert_at = table.lower().rfind("</tbody>")
+            if insert_at < 0:
+                insert_at = table.lower().rfind("</table>")
+            new_table = table[:insert_at] + rows_html + table[insert_at:]
+        return body[:start] + new_table + body[end:]
+
     def _clone_confluence_page_storage(
         self,
         conf_base: str,
@@ -2761,7 +3019,7 @@ class JiraClient:
         """
         source = self._get_json_absolute(
             f"{conf_base}/rest/api/content/{source_page_id}",
-            params={"expand": "body.storage,space,ancestors,_links"},
+            params={"expand": "body.storage,body.view,space,ancestors,_links"},
         ) or {}
 
         storage = (source.get("body") or {}).get("storage") or {}
@@ -2781,6 +3039,15 @@ class JiraClient:
             new_start=week_info["next_start"],
             new_end=week_info["next_end"],
         )
+
+        # '참조 지라 이슈 티켓' 매크로에 In-Verification 이슈가 있으면, 검토 의견
+        # 표의 데이터 행을 해당 이슈들로 교체한다 (매크로가 비어 있으면 그대로 둔다).
+        view_body = (((source.get("body") or {}).get("view") or {}).get("value")) or ""
+        reference_rows = self._extract_reference_jira_issue_rows(view_body)
+        if reference_rows:
+            cloned_body = self._fill_sccb_review_table_from_reference(cloned_body, reference_rows)
+        # 원본에 남은 지난 주 검토 의견('유관 부서 변경 부분'/'반영여부' 열)은 비운다.
+        cloned_body = self._clear_sccb_review_opinion_columns(cloned_body)
         representation = storage.get("representation") or "storage"
 
         payload = {
