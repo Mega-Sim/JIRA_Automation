@@ -868,8 +868,14 @@ class JiraSccbApp(tb.Window):
             return "FAIL"
         if not tcgen or "OK" not in (tcgen or "").upper():
             return "FAIL"
-        if not aio_test or 'OK' not in (aio_test or '').upper():
-            return 'FAIL'
+        aio_text = str(aio_test or "")
+        aio_upper = aio_text.upper()
+        if not aio_text:
+            return "N/A"
+        if "N/A" in aio_upper or "확인불가" in aio_text:
+            return "N/A"
+        if "OK" not in aio_upper:
+            return "FAIL"
         pr_text = str(pr_merge or "")
         pr_upper = pr_text.upper()
         if not pr_text or "MERGED" not in pr_upper:
