@@ -943,8 +943,13 @@ class JiraClient:
         diff = self.get_issue_difficulty(issue_key)
         required = self.DIFFICULTY_MIN_CASES.get(diff)
 
-        # 테스트 케이스가 실제로 존재하면 난이도 필드 추출 실패만으로 FAIL 처리하지 않는다.
-        # 이 경우 최소 개수 비교 기준이 없으므로 OK(actual/-)로 표시한다.
+        # AIO 검증은 tri-state로 판정한다.
+        # - OK: 실제 TC 수를 확인했고 기준을 충족했거나, 난이도 기준이 없지만 TC 존재가 확인됨
+        # - FAIL: 실제 TC 수를 확인했고 난이도별 최소 개수보다 부족함
+        # - N/A: 난이도 기준이 없거나 AIO API/화면에서 실제 TC 수를 확인할 수 없음
+        #
+        # 기존 구현은 "기준 없음/조회 불가"를 ERR로 표시하고 UI가 이를 FAIL로 처리했다.
+        # 확인 불가능한 상태를 실제 검증 실패로 오인하지 않도록 N/A로 분리한다.
         if not diff or required is None:
             if actual is not None and int(actual) > 0:
                 return {
@@ -953,6 +958,7 @@ class JiraClient:
                     "actual": int(actual),
                     "ok": True,
                     "status": f"OK({int(actual)}/-)",
+                    "verdict": "OK",
                     "cycle_totals": cycle_totals,
                 }
             return {
@@ -960,17 +966,19 @@ class JiraClient:
                 "required": required,
                 "actual": None,
                 "ok": False,
-                "status": "ERR(NO LEVEL)",
+                "status": "N/A(NO LEVEL)",
+                "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
 
         if actual is None:
             return {
                 "difficulty": diff,
-                "required": required,
+                "required": int(required),
                 "actual": None,
                 "ok": False,
-                "status": f"ERR(API/-/{required})",
+                "status": f"N/A(API/-/{int(required)})",
+                "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
 
@@ -982,6 +990,7 @@ class JiraClient:
             "actual": int(actual),
             "ok": ok,
             "status": status,
+            "verdict": "OK" if ok else "FAIL",
             "cycle_totals": cycle_totals,
         }
 
