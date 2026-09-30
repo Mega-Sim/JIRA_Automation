@@ -870,8 +870,19 @@ class JiraSccbApp(tb.Window):
             return "FAIL"
         if not aio_test or 'OK' not in (aio_test or '').upper():
             return 'FAIL'
-        if not pr_merge or "MERGED" not in (pr_merge or "").upper():
-            if pr_merge and "N/A" in pr_merge.upper():
+        pr_text = str(pr_merge or "")
+        pr_upper = pr_text.upper()
+        if not pr_text or "MERGED" not in pr_upper:
+            if "N/A" in pr_upper:
+                return "N/A"
+            return "FAIL"
+
+        # 최종 RESULT는 PR 병합뿐 아니라 서로 다른 reviewer 2명 승인까지 충족해야 OK.
+        # 이전 실행본의 병합 문자열만 남아 있는 경우 승인 검증을 건너뛰지 않고 확인불가로 둔다.
+        if "리뷰승인" not in pr_text:
+            return "N/A"
+        if "리뷰승인 OK(" not in pr_text:
+            if "N/A" in pr_upper or "확인불가" in pr_text:
                 return "N/A"
             return "FAIL"
         return "OK"
