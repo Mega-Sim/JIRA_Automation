@@ -1971,7 +1971,9 @@ class JiraClient:
         if not isinstance(user, dict):
             return ""
 
-        for field in ("id", "slug", "name", "emailAddress", "email", "displayName"):
+        # dev-status와 Bitbucket participants 응답 사이에서 id가 생략되는 경우가 있어
+        # 계정 문자열 계열을 먼저 사용하고 numeric id는 후순위 fallback으로 둔다.
+        for field in ("slug", "name", "emailAddress", "email", "id", "displayName"):
             value = user.get(field)
             if value is None:
                 continue
@@ -2194,7 +2196,6 @@ class JiraClient:
 
         locator = self._bitbucket_pr_locator(pr)
         direct_signatures: list[tuple[str, ...]] = []
-        direct_key_sets: list[set[str]] = []
         last_error = None
 
         if locator:
@@ -2207,7 +2208,6 @@ class JiraClient:
                 keys = self._approved_reviewer_keys(entries)
                 signature = tuple(sorted(keys))
                 direct_signatures.append(signature)
-                direct_key_sets.append(keys)
 
                 # 동일 결과가 2회 확인되면 안정된 값으로 채택한다.
                 if direct_signatures.count(signature) >= 2:
@@ -2348,6 +2348,11 @@ class JiraClient:
         status = self.get_pr_merge_status(issue_key, issue_id)
         return "MERGED" in str(status or "").upper()
 
+    def get_pr_gate_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
+        """최종 PR gate: 병합 + 서로 다른 reviewer 2명 승인 모두 충족."""
+        status = str(self.get_pr_merge_status(issue_key, issue_id) or "")
+        return "MERGED" in status.upper() and "리뷰승인 OK(" in status
+
     def get_pr_merge_status(self, issue_key: str, issue_id: str | None = None) -> str:
         """PR 상태 요약 문자열을 반환한다.
 
@@ -2468,7 +2473,7 @@ class JiraClient:
             futures["rollout"] = executor.submit(self.get_design_rollout_ok, issue_key, desc)
             futures["link"] = executor.submit(self.get_link_validation, issue_key, issuelinks)
             futures["tc"] = executor.submit(self.get_tc_generation_check, issue_key)
-            futures["pr_merge"] = executor.submit(self.get_pr_merge_ok, issue_key, issue_id)
+            futures["pr_merge"] = executor.submit(self.get_pr_gate_ok, issue_key, issue_id)
 
             # AIO/PR은 여러 endpoint를 순회하므로 timeout을 넉넉하게 준다.
             SLOW_KEYS = {"tc", "pr_merge"}
