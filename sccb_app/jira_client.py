@@ -7,7 +7,7 @@ import html as _html
 import json
 import time
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, quote
 import time as _time
 
 
@@ -943,8 +943,13 @@ class JiraClient:
         diff = self.get_issue_difficulty(issue_key)
         required = self.DIFFICULTY_MIN_CASES.get(diff)
 
-        # 테스트 케이스가 실제로 존재하면 난이도 필드 추출 실패만으로 FAIL 처리하지 않는다.
-        # 이 경우 최소 개수 비교 기준이 없으므로 OK(actual/-)로 표시한다.
+        # AIO 검증은 tri-state로 판정한다.
+        # - OK: 실제 TC 수를 확인했고 기준을 충족했거나, 난이도 기준이 없지만 TC 존재가 확인됨
+        # - FAIL: 실제 TC 수를 확인했고 난이도별 최소 개수보다 부족함
+        # - N/A: 난이도 기준이 없거나 AIO API/화면에서 실제 TC 수를 확인할 수 없음
+        #
+        # 기존 구현은 "기준 없음/조회 불가"를 ERR로 표시하고 UI가 이를 FAIL로 처리했다.
+        # 확인 불가능한 상태를 실제 검증 실패로 오인하지 않도록 N/A로 분리한다.
         if not diff or required is None:
             if actual is not None and int(actual) > 0:
                 return {
@@ -953,6 +958,7 @@ class JiraClient:
                     "actual": int(actual),
                     "ok": True,
                     "status": f"OK({int(actual)}/-)",
+                    "verdict": "OK",
                     "cycle_totals": cycle_totals,
                 }
             return {
@@ -960,17 +966,19 @@ class JiraClient:
                 "required": required,
                 "actual": None,
                 "ok": False,
-                "status": "ERR(NO LEVEL)",
+                "status": "N/A(NO LEVEL)",
+                "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
 
         if actual is None:
             return {
                 "difficulty": diff,
-                "required": required,
+                "required": int(required),
                 "actual": None,
                 "ok": False,
-                "status": f"ERR(API/-/{required})",
+                "status": f"N/A(API/-/{int(required)})",
+                "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
 
@@ -982,6 +990,7 @@ class JiraClient:
             "actual": int(actual),
             "ok": ok,
             "status": status,
+            "verdict": "OK" if ok else "FAIL",
             "cycle_totals": cycle_totals,
         }
 
@@ -1893,6 +1902,403 @@ class JiraClient:
             return "UNKNOWN"
         return s or "UNKNOWN"
 
+
+    @staticmethod
+    def _extract_pr_url(pr: dict) -> str:
+        """PR 객체에서 pull request URL을 재귀적으로 찾는다."""
+        if not isinstance(pr, dict):
+            return ""
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for key in ("url", "href"):
+                    value = obj.get(key)
+                    if isinstance(value, str) and "pull" in value.lower():
+                        return value
+                for value in obj.values():
+                    found = walk(value)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for value in obj:
+                    found = walk(value)
+                    if found:
+                        return found
+            return ""
+
+        return walk(pr)
+
+    @classmethod
+    def _pr_identity_key(cls, pr: dict) -> str:
+        """저장소가 다른 동일 PR 번호가 충돌하지 않도록 PR 식별키를 만든다."""
+        if not isinstance(pr, dict):
+            return str(pr)
+
+        repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+        project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+        project_key = (
+            project.get("key")
+            or project.get("name")
+            or pr.get("projectKey")
+            or pr.get("project")
+            or ""
+        )
+        repo_slug = (
+            repository.get("slug")
+            or repository.get("name")
+            or pr.get("repositorySlug")
+            or pr.get("repoSlug")
+            or ""
+        )
+        pr_id = (
+            pr.get("id")
+            or pr.get("pullRequestId")
+            or pr.get("prId")
+            or pr.get("pr_id")
+            or pr.get("pullrequest_id")
+            or ""
+        )
+        pr_url = cls._extract_pr_url(pr)
+
+        parts = [str(project_key or "").strip().lower(),
+                 str(repo_slug or "").strip().lower(),
+                 str(pr_url or "").strip().lower(),
+                 str(pr_id or "").strip()]
+        if any(parts):
+            return "|".join(parts)
+        try:
+            return json.dumps(pr, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            return str(pr)
+
+    @staticmethod
+    def _canonical_reviewer_key(participant: dict) -> str:
+        """동일 승인자가 여러 응답에 중복 등장해도 한 명으로 세기 위한 사용자 키."""
+        if not isinstance(participant, dict):
+            return ""
+        user = participant.get("user") if isinstance(participant.get("user"), dict) else participant
+        if not isinstance(user, dict):
+            return ""
+
+        # dev-status와 Bitbucket participants 응답 사이에서 id가 생략되는 경우가 있어
+        # 계정 문자열 계열을 먼저 사용하고 numeric id는 후순위 fallback으로 둔다.
+        for field in ("slug", "name", "emailAddress", "email", "id", "displayName"):
+            value = user.get(field)
+            if value is None:
+                continue
+            text = str(value).strip().lower()
+            if text:
+                return f"{field.lower()}:{text}"
+        return ""
+
+    @staticmethod
+    def _is_approved_review_state(participant: dict) -> bool:
+        """APPROVED만 승인으로 본다. UNAPPROVED 문자열 부분 일치는 허용하지 않는다."""
+        if not isinstance(participant, dict):
+            return False
+        if participant.get("approved") is True:
+            return True
+
+        for field in ("status", "approvalStatus", "reviewStatus", "state"):
+            value = participant.get(field)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("value") or value.get("status") or value.get("state")
+            state = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+            if state in {"APPROVED", "APPROVE"}:
+                return True
+        return False
+
+    @staticmethod
+    def _is_reviewer_participant(participant: dict, source: str = "participants") -> bool:
+        if not isinstance(participant, dict):
+            return False
+        role = participant.get("role")
+        if isinstance(role, dict):
+            role = role.get("name") or role.get("value") or role.get("role")
+        role_text = str(role or "").strip().upper()
+        if role_text:
+            return role_text == "REVIEWER"
+        # reviewers 컨테이너에 들어 있는 항목은 role 필드가 생략될 수 있다.
+        return source == "reviewers"
+
+    @classmethod
+    def _approved_reviewer_keys(cls, entries: list[tuple[dict, str]]) -> set[str]:
+        approved: set[str] = set()
+        for participant, source in entries:
+            if not cls._is_reviewer_participant(participant, source):
+                continue
+            if not cls._is_approved_review_state(participant):
+                continue
+            key = cls._canonical_reviewer_key(participant)
+            if key:
+                approved.add(key)
+        return approved
+
+    @classmethod
+    def _extract_embedded_reviewer_entries(cls, pr: dict) -> tuple[list[tuple[dict, str]], bool]:
+        """dev-status PR 객체 안의 participants/reviewers를 재귀적으로 모은다."""
+        entries: list[tuple[dict, str]] = []
+        found_container = False
+
+        def add_items(value, source: str):
+            nonlocal found_container
+            found_container = True
+            if isinstance(value, list):
+                items = value
+            elif isinstance(value, dict):
+                for child_key in ("values", "items", "data", "results", "content"):
+                    child = value.get(child_key)
+                    if isinstance(child, list):
+                        items = child
+                        break
+                else:
+                    items = [value]
+            else:
+                items = []
+
+            for item in items:
+                if isinstance(item, dict):
+                    entries.append((item, source))
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    kl = str(key).lower()
+                    if kl in {"participants", "participant"}:
+                        add_items(value, "participants")
+                    elif kl in {"reviewers", "reviewer"}:
+                        add_items(value, "reviewers")
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    walk(value)
+
+        walk(pr)
+        return entries, found_container
+
+    @classmethod
+    def _bitbucket_pr_locator(cls, pr: dict):
+        """Bitbucket Server/Data Center PR의 base/project/repo/id를 추출한다."""
+        if not isinstance(pr, dict):
+            return None
+
+        url = cls._extract_pr_url(pr)
+        parsed = urlparse(url) if url else None
+        project_key = ""
+        repo_slug = ""
+        pr_id = ""
+
+        if parsed and parsed.scheme and parsed.netloc:
+            match = re.search(
+                r"/(?:projects/([^/]+)|users/([^/]+))/repos/([^/]+)/pull-requests/(\d+)",
+                parsed.path or "",
+                flags=re.IGNORECASE,
+            )
+            if match:
+                project_key = match.group(1) or (f"~{match.group(2)}" if match.group(2) else "")
+                repo_slug = match.group(3) or ""
+                pr_id = match.group(4) or ""
+
+        repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+        project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+        project_key = project_key or str(
+            project.get("key")
+            or pr.get("projectKey")
+            or ""
+        )
+        repo_slug = repo_slug or str(
+            repository.get("slug")
+            or pr.get("repositorySlug")
+            or pr.get("repoSlug")
+            or ""
+        )
+        pr_id = pr_id or str(
+            pr.get("id")
+            or pr.get("pullRequestId")
+            or pr.get("prId")
+            or pr.get("pr_id")
+            or ""
+        )
+
+        if not (parsed and parsed.scheme and parsed.netloc and project_key and repo_slug and pr_id):
+            return None
+        return {
+            "base_url": f"{parsed.scheme}://{parsed.netloc}",
+            "project_key": project_key,
+            "repo_slug": repo_slug,
+            "pr_id": pr_id,
+        }
+
+    def _fetch_bitbucket_participants_once(self, pr: dict):
+        """Bitbucket participants API 전체 페이지를 1회 조회한다.
+
+        성공 시 (participants, None), 식별/권한/조회 실패 시 (None, reason)를 반환한다.
+        """
+        locator = self._bitbucket_pr_locator(pr)
+        if not locator:
+            return None, "locator_unavailable"
+
+        base = locator["base_url"].rstrip("/")
+        project_key = quote(str(locator["project_key"]), safe="~")
+        repo_slug = quote(str(locator["repo_slug"]), safe="")
+        pr_id = quote(str(locator["pr_id"]), safe="")
+        url = (
+            f"{base}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}"
+            f"/pull-requests/{pr_id}/participants"
+        )
+
+        out: list[dict] = []
+        start = 0
+        seen_starts = set()
+
+        while True:
+            if start in seen_starts:
+                return None, "pagination_loop"
+            seen_starts.add(start)
+
+            try:
+                response = self._session().get(
+                    url,
+                    params={"start": start, "limit": 100},
+                    timeout=self.timeout,
+                    headers={"Accept": "application/json"},
+                )
+            except Exception:
+                return None, "request_error"
+
+            if response.status_code in (401, 403):
+                return None, "permission"
+            if response.status_code == 404:
+                return None, "not_found"
+            try:
+                response.raise_for_status()
+                data = response.json() if (response.text or "").strip() else {}
+            except Exception:
+                return None, "invalid_response"
+
+            values = data.get("values") if isinstance(data, dict) else None
+            if not isinstance(values, list):
+                return None, "invalid_response"
+            out.extend(item for item in values if isinstance(item, dict))
+
+            if data.get("isLastPage") is True:
+                break
+            next_start = data.get("nextPageStart")
+            if next_start is None:
+                break
+            try:
+                next_start = int(next_start)
+            except Exception:
+                return None, "invalid_pagination"
+            if next_start == start:
+                return None, "pagination_loop"
+            start = next_start
+
+        return out, None
+
+    def _review_approval_for_pr(self, pr: dict, required_count: int = 2) -> dict:
+        """한 PR의 서로 다른 승인 reviewer 수를 안정적으로 계산한다."""
+        required_count = max(1, int(required_count or 2))
+        embedded_entries, embedded_known = self._extract_embedded_reviewer_entries(pr)
+        embedded_keys = self._approved_reviewer_keys(embedded_entries)
+
+        locator = self._bitbucket_pr_locator(pr)
+        direct_signatures: list[tuple[str, ...]] = []
+        last_error = None
+
+        if locator:
+            for _ in range(3):
+                participants, err = self._fetch_bitbucket_participants_once(pr)
+                last_error = err
+                if participants is None:
+                    continue
+                entries = [(item, "participants") for item in participants]
+                keys = self._approved_reviewer_keys(entries)
+                signature = tuple(sorted(keys))
+                direct_signatures.append(signature)
+
+                # 동일 결과가 2회 확인되면 안정된 값으로 채택한다.
+                if direct_signatures.count(signature) >= 2:
+                    count = len(keys)
+                    return {
+                        "ok": count >= required_count,
+                        "count": count,
+                        "required": required_count,
+                        "complete": True,
+                        "source": "bitbucket",
+                        "reviewers": sorted(keys),
+                    }
+
+        # 직접 조회가 한 번이라도 됐지만 3회 내 동일 결과 2회를 확보하지 못하면
+        # 임의의 순간값으로 FAIL 처리하지 않는다.
+        if direct_signatures:
+            best = max((set(sig) for sig in direct_signatures), key=len, default=set())
+            return {
+                "ok": False,
+                "count": len(best),
+                "required": required_count,
+                "complete": False,
+                "source": "bitbucket_unstable",
+                "reviewers": sorted(best),
+                "reason": "unstable",
+            }
+
+        # Bitbucket 직접 조회가 불가능한 환경에서는 dev-status가 명시적으로
+        # participants/reviewers 컨테이너를 제공한 경우에만 그 값을 사용한다.
+        if embedded_known:
+            count = len(embedded_keys)
+            return {
+                "ok": count >= required_count,
+                "count": count,
+                "required": required_count,
+                "complete": True,
+                "source": "devstatus",
+                "reviewers": sorted(embedded_keys),
+                "reason": last_error,
+            }
+
+        return {
+            "ok": False,
+            "count": 0,
+            "required": required_count,
+            "complete": False,
+            "source": "unavailable",
+            "reviewers": [],
+            "reason": last_error or "reviewer_data_unavailable",
+        }
+
+    def _summarize_pr_review_approval(self, prs: list[dict], required_count: int = 2) -> str:
+        """연결 PR 중 병합된 PR을 우선으로 리뷰 승인 충족 여부를 요약한다."""
+        unique_prs: list[dict] = []
+        seen = set()
+        for pr in prs or []:
+            if not isinstance(pr, dict):
+                continue
+            key = self._pr_identity_key(pr)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_prs.append(pr)
+
+        if not unique_prs:
+            return "리뷰승인 N/A(확인불가)"
+
+        merged = [pr for pr in unique_prs if self._normalize_pr_status(pr) == "MERGED"]
+        candidates = merged or unique_prs
+        results = [self._review_approval_for_pr(pr, required_count) for pr in candidates]
+
+        for result in results:
+            if result.get("ok") is True and result.get("complete") is True:
+                return f"리뷰승인 OK({result.get('count', 0)}/{result.get('required', required_count)})"
+
+        complete_results = [r for r in results if r.get("complete") is True]
+        if complete_results:
+            best = max(complete_results, key=lambda r: int(r.get("count") or 0))
+            return f"리뷰승인 FAIL({best.get('count', 0)}/{best.get('required', required_count)})"
+
+        return "리뷰승인 N/A(확인불가)"
+
     def _get_devstatus_app_types(self, issue_id: str) -> tuple[list[str], int, bool]:
         """dev-status summary에서 PR applicationType 후보와 overall count를 얻는다."""
         app_types: list[str] = []
@@ -1951,6 +2357,11 @@ class JiraClient:
         status = self.get_pr_merge_status(issue_key, issue_id)
         return "MERGED" in str(status or "").upper()
 
+    def get_pr_gate_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
+        """최종 PR gate: 병합 + 서로 다른 reviewer 2명 승인 모두 충족."""
+        status = str(self.get_pr_merge_status(issue_key, issue_id) or "")
+        return "MERGED" in status.upper() and "리뷰승인 OK(" in status
+
     def get_pr_merge_status(self, issue_key: str, issue_id: str | None = None) -> str:
         """PR 상태 요약 문자열을 반환한다.
 
@@ -1976,6 +2387,7 @@ class JiraClient:
             any_no_permission = False
             any_error = bool(summary_error)
             seen_pr = set()
+            pr_records: list[dict] = []
 
             for app_type in app_types_to_try:
                 try:
@@ -1990,12 +2402,12 @@ class JiraClient:
                     any_success = True
                     prs = self._extract_pull_requests_from_devstatus_payload(data)
                     for pr in prs:
-                        pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or str(pr)
-                        pid = str(pid)
+                        pid = self._pr_identity_key(pr)
                         if pid in seen_pr:
                             continue
                         seen_pr.add(pid)
                         total_pr += 1
+                        pr_records.append(pr)
                         st = self._normalize_pr_status(pr)
                         counts[st] = counts.get(st, 0) + 1
                 except requests.HTTPError as e:
@@ -2030,7 +2442,10 @@ class JiraClient:
             for k in sorted(counts.keys()):
                 if k not in order:
                     parts.append(f"{k}({counts[k]})")
-            return ",".join(parts)
+
+            merge_summary = ",".join(parts)
+            review_summary = self._summarize_pr_review_approval(pr_records, required_count=2)
+            return f"{merge_summary} / {review_summary}"
         except Exception:
             return "ERR"
 
@@ -2067,7 +2482,7 @@ class JiraClient:
             futures["rollout"] = executor.submit(self.get_design_rollout_ok, issue_key, desc)
             futures["link"] = executor.submit(self.get_link_validation, issue_key, issuelinks)
             futures["tc"] = executor.submit(self.get_tc_generation_check, issue_key)
-            futures["pr_merge"] = executor.submit(self.get_pr_merge_ok, issue_key, issue_id)
+            futures["pr_merge"] = executor.submit(self.get_pr_gate_ok, issue_key, issue_id)
 
             # AIO/PR은 여러 endpoint를 순회하므로 timeout을 넉넉하게 준다.
             SLOW_KEYS = {"tc", "pr_merge"}
