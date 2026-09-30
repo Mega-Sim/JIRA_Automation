@@ -188,6 +188,18 @@ class PrReviewApprovalTests(unittest.TestCase):
             client._summarize_pr_review_approval([pr], required_count=2),
         )
 
+    def test_final_gate_requires_merge_and_two_reviewers(self):
+        client = make_client()
+
+        client.get_pr_merge_status = lambda issue_key, issue_id=None: "MERGED(1) / 리뷰승인 OK(2/2)"
+        self.assertTrue(client.get_pr_gate_ok("AMVCS30-56"))
+
+        client.get_pr_merge_status = lambda issue_key, issue_id=None: "MERGED(1) / 리뷰승인 FAIL(1/2)"
+        self.assertFalse(client.get_pr_gate_ok("AMVCS30-56"))
+
+        client.get_pr_merge_status = lambda issue_key, issue_id=None: "OPEN(1) / 리뷰승인 OK(2/2)"
+        self.assertFalse(client.get_pr_gate_ok("AMVCS30-56"))
+
 
 if __name__ == "__main__":
     unittest.main()
