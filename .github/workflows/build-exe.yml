@@ -3,6 +3,8 @@ name: Build Windows Executable
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:   # 수동 실행 버튼
 
 jobs:
