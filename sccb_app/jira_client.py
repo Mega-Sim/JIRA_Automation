@@ -1363,6 +1363,7 @@ class JiraClient:
         if ok:
             if debug:
                 print(f"[DEBUG STATUS] 표에 데이터 있음 → 'OK' 반환")
+            self._trace(f"[연관에러] {issue_key}: 표 데이터 존재 => OK")
             return "OK"
 
         # 사유 텍스트 탐지
@@ -1377,10 +1378,12 @@ class JiraClient:
         if has_reason:
             if debug:
                 print(f"[DEBUG STATUS] 최종 결과: '사유 작성'")
+            self._trace(f"[연관에러] {issue_key}: 표 데이터 없음, 사유 텍스트 존재 => 사유 작성")
             return "사유 작성"
         
         if debug:
             print(f"[DEBUG STATUS] 최종 결과: 'FAIL'")
+        self._trace(f"[연관에러] {issue_key}: 표 데이터/사유 없음 => FAIL")
         return "FAIL"
 
     def get_design_rollout_status(self, issue_key: str, desc: str | None = None, debug: bool = False) -> str:
@@ -1405,6 +1408,7 @@ class JiraClient:
         if ok:
             if debug:
                 print(f"[DEBUG STATUS] 표에 데이터 있음 → 'OK' 반환")
+            self._trace(f"[횡전개] {issue_key}: 표 데이터 존재 => OK")
             return "OK"
 
         if debug:
@@ -1418,10 +1422,12 @@ class JiraClient:
         if has_reason:
             if debug:
                 print(f"[DEBUG STATUS] 최종 결과: '사유 작성'")
+            self._trace(f"[횡전개] {issue_key}: 표 데이터 없음, 사유 텍스트 존재 => 사유 작성")
             return "사유 작성"
         
         if debug:
             print(f"[DEBUG STATUS] 최종 결과: 'FAIL'")
+        self._trace(f"[횡전개] {issue_key}: 표 데이터/사유 없음 => FAIL")
         return "FAIL"
 
     def _has_reason_text_around_table(self, desc, heading_candidates: list[str], debug=False) -> bool:
