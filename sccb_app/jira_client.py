@@ -413,8 +413,9 @@ class JiraClient:
         return f"{len(plain)} 자"
 
     def get_body_length_string_from_ui(self, issue_key: str) -> str:
-        """본문 길이 확인 - 최적화된 버전"""
-        # 1차: Description_Checker API 시도 (가장 빠름)
+        """본문 길이 확인 - API 우선, browse HTML fallback."""
+        self._trace(f"[본문길이] {issue_key}: 조회 시작")
+
         try:
             txt = self.get_text(
                 "/rest/scriptrunner/latest/custom/Description_Checker",
@@ -426,40 +427,52 @@ class JiraClient:
             )
             v = self._extract_len_string(txt)
             if v:
+                self._trace(f"[본문길이] {issue_key}: Description_Checker => {v}")
                 return v
             v2 = self._extract_len_string_from_description_checker_html(txt)
             if v2:
+                self._trace(f"[본문길이] {issue_key}: Description_Checker HTML => {v2}")
                 return v2
-        except Exception:
-            pass
+            self._trace(f"[본문길이] {issue_key}: Description_Checker 응답에서 길이 미검출")
+        except Exception as exc:
+            self._trace(
+                f"[본문길이] {issue_key}: Description_Checker 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
-        # 2차: browse HTML에서 "길이 확인" 링크 찾기
         try:
             browse_html = self.get_text(f"/browse/{issue_key}")
             if not browse_html:
+                self._trace(f"[본문길이] {issue_key}: browse HTML 비어 있음")
                 return ""
 
             candidates: list[str] = []
             for m in re.finditer(r'href="([^"]+)"[^>]*>\s*길이\s*확인\s*<', browse_html):
                 candidates.append(m.group(1))
-            
-            # 가장 가능성 높은 후보만 시도
+
+            self._trace(f"[본문길이] {issue_key}: 길이 확인 링크 후보={len(candidates)}")
             if candidates:
-                c = candidates[0]
-                c = _html.unescape(c)
-                c = c.replace("\\/", "/")
+                c = _html.unescape(candidates[0]).replace("\\/", "/")
                 if c.startswith("//"):
                     c = "https:" + c
                 try:
                     panel_txt = self.get_text(c)
                     v = self._extract_len_string(panel_txt)
                     if v:
+                        self._trace(f"[본문길이] {issue_key}: browse panel fallback => {v}")
                         return v
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        
+                except Exception as exc:
+                    self._trace(
+                        f"[본문길이] {issue_key}: browse panel 실패 "
+                        f"({type(exc).__name__}: {str(exc)[:140]})"
+                    )
+        except Exception as exc:
+            self._trace(
+                f"[본문길이] {issue_key}: browse fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
+
+        self._trace(f"[본문길이] {issue_key}: 최종 확인불가")
         return ""
 
     def _extract_tc_complete_count(self, txt: str) -> int:
@@ -955,28 +968,29 @@ class JiraClient:
         return int(best), counts
 
     def get_aio_test_validation(self, issue_key: str) -> dict:
+        self._trace(f"[AIO] {issue_key}: 검증 시작")
         issue_id = ""
         project_id = None
         try:
             issue_id, project_id = self._get_issue_meta_for_aio(issue_key)
-        except Exception:
+            self._trace(f"[AIO] {issue_key}: issue_id={issue_id or '-'}, project_id={project_id}")
+        except Exception as exc:
             issue_id, project_id = "", None
+            self._trace(
+                f"[AIO] {issue_key}: issue meta 조회 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
         actual, cycle_totals = self._get_aio_actual_count(issue_key, issue_id, project_id)
+        self._trace(f"[AIO] {issue_key}: actual={actual}, 후보={cycle_totals}")
 
         diff = self.get_issue_difficulty(issue_key)
         required = self.DIFFICULTY_MIN_CASES.get(diff)
+        self._trace(f"[AIO] {issue_key}: difficulty={diff or '-'}, required={required}")
 
-        # AIO 검증은 tri-state로 판정한다.
-        # - OK: 실제 TC 수를 확인했고 기준을 충족했거나, 난이도 기준이 없지만 TC 존재가 확인됨
-        # - FAIL: 실제 TC 수를 확인했고 난이도별 최소 개수보다 부족함
-        # - N/A: 난이도 기준이 없거나 AIO API/화면에서 실제 TC 수를 확인할 수 없음
-        #
-        # 기존 구현은 "기준 없음/조회 불가"를 ERR로 표시하고 UI가 이를 FAIL로 처리했다.
-        # 확인 불가능한 상태를 실제 검증 실패로 오인하지 않도록 N/A로 분리한다.
         if not diff or required is None:
             if actual is not None and int(actual) > 0:
-                return {
+                result = {
                     "difficulty": diff,
                     "required": required,
                     "actual": int(actual),
@@ -985,18 +999,21 @@ class JiraClient:
                     "verdict": "OK",
                     "cycle_totals": cycle_totals,
                 }
-            return {
-                "difficulty": diff,
-                "required": required,
-                "actual": None,
-                "ok": False,
-                "status": "N/A(NO LEVEL)",
-                "verdict": "N/A",
-                "cycle_totals": cycle_totals,
-            }
+            else:
+                result = {
+                    "difficulty": diff,
+                    "required": required,
+                    "actual": None,
+                    "ok": False,
+                    "status": "N/A(NO LEVEL)",
+                    "verdict": "N/A",
+                    "cycle_totals": cycle_totals,
+                }
+            self._trace(f"[AIO] {issue_key}: 최종 => {result['status']}")
+            return result
 
         if actual is None:
-            return {
+            result = {
                 "difficulty": diff,
                 "required": int(required),
                 "actual": None,
@@ -1005,10 +1022,12 @@ class JiraClient:
                 "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
+            self._trace(f"[AIO] {issue_key}: 최종 => {result['status']}")
+            return result
 
         ok = int(actual) >= int(required)
         status = ("OK" if ok else "FAIL") + f"({int(actual)}/{int(required)})"
-        return {
+        result = {
             "difficulty": diff,
             "required": int(required),
             "actual": int(actual),
@@ -1017,6 +1036,8 @@ class JiraClient:
             "verdict": "OK" if ok else "FAIL",
             "cycle_totals": cycle_totals,
         }
+        self._trace(f"[AIO] {issue_key}: 최종 => {status}")
+        return result
 
     @staticmethod
     def _parse_tc_generation_status(data=None, text: str = "") -> dict:
@@ -1151,40 +1172,59 @@ class JiraClient:
         return data, text
 
     def get_tc_generation_check(self, issue_key: str) -> dict:
+        self._trace(f"[LLM TC] {issue_key}: 검증 시작")
         data = None
         text = ""
         try:
             data, text = self._post_tc_status_payload(issue_key)
-        except Exception:
+            self._trace(f"[LLM TC] {issue_key}: CheckTCStatus API 응답 수신")
+        except Exception as exc:
             data, text = None, ""
+            self._trace(
+                f"[LLM TC] {issue_key}: CheckTCStatus API 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
         parsed = self._parse_tc_generation_status(data, text)
+        self._trace(f"[LLM TC] {issue_key}: API parse={parsed}")
         if parsed.get("ok"):
             return parsed
         if int(parsed.get("failed_count", 0) or 0) > 0 or int(parsed.get("in_progress_count", 0) or 0) > 0:
             return parsed
 
-        # API 응답이 비어 있거나 불완전한 경우 화면 HTML/생성된 AIO TC를 fallback으로 확인한다.
         try:
             html = self.get_text(f"/browse/{issue_key}")
-        except Exception:
+            self._trace(f"[LLM TC] {issue_key}: browse HTML fallback 조회")
+        except Exception as exc:
             html = ""
+            self._trace(
+                f"[LLM TC] {issue_key}: browse fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
+
         html_parsed = self._parse_tc_generation_status(None, html)
+        self._trace(f"[LLM TC] {issue_key}: HTML parse={html_parsed}")
         if html_parsed.get("ok"):
             return html_parsed
         if int(html_parsed.get("failed_count", 0) or 0) > 0 or int(html_parsed.get("in_progress_count", 0) or 0) > 0:
             return html_parsed
 
-        # LLM History API가 빈 값이더라도 AIO TestCase가 실제 생성되어 있으면 생성 완료로 본다.
-        # 사용자 화면의 AMAMRAPP-602처럼 History 완료 + AIO TC 존재인데 CheckTCStatus만 0으로 내려오는 케이스 방어.
         try:
             issue_id, project_id = self._get_issue_meta_for_aio(issue_key)
             actual, _ = self._get_aio_actual_count(issue_key, issue_id, project_id)
-        except Exception:
+        except Exception as exc:
             actual = None
-        if actual is not None and int(actual) > 0:
-            return {"complete_count": 1, "in_progress_count": 0, "failed_count": 0, "ok": True}
+            self._trace(
+                f"[LLM TC] {issue_key}: AIO TC fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
+        if actual is not None and int(actual) > 0:
+            result = {"complete_count": 1, "in_progress_count": 0, "failed_count": 0, "ok": True}
+            self._trace(f"[LLM TC] {issue_key}: AIO TC {actual}건 존재 => OK fallback")
+            return result
+
+        self._trace(f"[LLM TC] {issue_key}: 최종 => {parsed}")
         return parsed
 
     def get_error_table_ok(self, issue_key: str, desc: str | None = None) -> bool:
