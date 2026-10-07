@@ -1769,9 +1769,8 @@ class JiraClient:
     def get_link_validation(self, issue_key: str, links=None) -> dict:
         """이슈 링크 검증.
 
-        확인된 Jira 화면 기준:
-          - SW_VOC는 `is child of`뿐 아니라 `relates to`에도 연결될 수 있다.
-          - 따라서 inwardIssue/outwardIssue 양쪽을 모두 보며, 상대 이슈의 issuetype/name 또는 key로 판별한다.
+        embedded issuelinks 응답의 fields가 축약되어 issuetype이 누락될 수 있으므로,
+        1차 embedded 판정 후 미충족 항목이 있으면 연결 이슈 key로 상세 정보를 재조회한다.
         """
         if links is None:
             data = self.get(
@@ -1780,45 +1779,123 @@ class JiraClient:
             )
             links = (data.get("fields") or {}).get("issuelinks") or []
 
+        links = links or []
+        self._trace(f"[링크] {issue_key}: issuelinks {len(links)}건 검사 시작")
+
         sw_voc_ok = False
         has_func_req = False
         has_detail_design = False
+        checked: list[dict] = []
+        linked_by_key: dict[str, dict] = {}
 
         def _norm(value) -> str:
             return str(value or "").strip().lower()
 
-        def _linked_issue_info(issue: dict) -> tuple[str, str]:
+        def _token(value) -> str:
+            return re.sub(r"[^a-z0-9가-힣]", "", _norm(value))
+
+        def _issue_type_name(issue: dict) -> str:
             fields = issue.get("fields") or {}
-            issue_type = ((fields.get("issuetype") or {}).get("name") or "")
-            key = issue.get("key") or ""
-            return _norm(issue_type), _norm(key)
+            raw = fields.get("issuetype")
+            if isinstance(raw, dict):
+                return str(raw.get("name") or raw.get("value") or "")
+            return str(raw or "")
+
+        def _issue_summary(issue: dict) -> str:
+            fields = issue.get("fields") or {}
+            return str(fields.get("summary") or "")
 
         def _is_sw_voc(issue_type: str, key: str) -> bool:
-            # 사내 SW_VOC 이슈는 화면/툴팁상 SW_VOC로 표시되고, 실제 key는 AMSWV-* 형태도 사용된다.
-            if "sw_voc" in issue_type or "sw voc" in issue_type:
+            t = _token(issue_type)
+            k = _norm(key)
+            if "swvoc" in t or ("voc" in t and "sw" in t):
                 return True
-            if "voc" in issue_type and "sw" in issue_type:
-                return True
-            if key.startswith("amswv-") or key.startswith("swvoc-") or key.startswith("sw_voc-"):
-                return True
-            return False
+            return k.startswith(("amswv-", "swvoc-", "sw_voc-"))
 
+        def _is_function_requirement(issue_type: str) -> bool:
+            t = _token(issue_type)
+            return "functionrequirement" in t or "functionalrequirement" in t
+
+        def _is_detail_design(issue_type: str) -> bool:
+            t = _token(issue_type)
+            return "detaildesign" in t or "detaileddesign" in t
+
+        def classify(key: str, issue_type: str, summary: str, source: str, relation: str = ""):
+            nonlocal sw_voc_ok, has_func_req, has_detail_design
+            sw = _is_sw_voc(issue_type, key)
+            fr = _is_function_requirement(issue_type)
+            dd = _is_detail_design(issue_type)
+            sw_voc_ok = sw_voc_ok or sw
+            has_func_req = has_func_req or fr
+            has_detail_design = has_detail_design or dd
+            checked.append({
+                "key": key,
+                "issue_type": issue_type,
+                "summary": summary,
+                "source": source,
+                "relation": relation,
+                "sw_voc": sw,
+                "function_requirement": fr,
+                "detail_design": dd,
+            })
+            self._trace(
+                f"[링크] {issue_key}: {key or '-'} type='{issue_type or '-'}' "
+                f"relation='{relation or '-'}' source={source} "
+                f"=> SW_VOC={sw}, Function Requirement={fr}, Detail Design={dd}"
+            )
+
+        # 1차: issuelinks embedded fields로 판정
         for link in links:
-            # SW_VOC / Function Requirement / Detail Design 모두 link 방향과 link type에 의존하지 않고
-            # 실제 연결된 상대 이슈의 타입/키를 기준으로 판단한다.
+            link_type = link.get("type") if isinstance(link.get("type"), dict) else {}
+            relation = " / ".join(
+                str(v) for v in (
+                    link_type.get("name"),
+                    link_type.get("inward"),
+                    link_type.get("outward"),
+                ) if v
+            )
             for side_key in ("inwardIssue", "outwardIssue"):
                 side = link.get(side_key)
-                if not side:
+                if not isinstance(side, dict):
                     continue
+                key = str(side.get("key") or "").strip()
+                if key:
+                    linked_by_key.setdefault(key.upper(), side)
+                classify(
+                    key,
+                    _issue_type_name(side),
+                    _issue_summary(side),
+                    "embedded",
+                    relation,
+                )
 
-                issue_type, key = _linked_issue_info(side)
-
-                if _is_sw_voc(issue_type, key):
-                    sw_voc_ok = True
-                if "function requirement" in issue_type or "function_requirement" in issue_type:
-                    has_func_req = True
-                if "detail design" in issue_type or "detail_design" in issue_type:
-                    has_detail_design = True
+        # 2차: 하나라도 미충족이면 연결 이슈 상세를 key 기준으로 재조회.
+        # Jira search/core 응답이 linked issue fields를 축약하는 환경에서 발생하는 false missing 방지.
+        if linked_by_key and not (sw_voc_ok and has_func_req and has_detail_design):
+            self._trace(
+                f"[링크] {issue_key}: embedded 판정 미충족 "
+                f"(SW_VOC={sw_voc_ok}, Function Requirement={has_func_req}, Detail Design={has_detail_design}) "
+                f"=> 연결 이슈 상세 재조회"
+            )
+            for key_upper, embedded in linked_by_key.items():
+                try:
+                    detail = self.get(
+                        f"/rest/api/2/issue/{key_upper}",
+                        params={"fields": "issuetype,summary"},
+                    ) or {}
+                    classify(
+                        str(detail.get("key") or key_upper),
+                        _issue_type_name(detail),
+                        _issue_summary(detail),
+                        "issue-detail",
+                    )
+                    if sw_voc_ok and has_func_req and has_detail_design:
+                        break
+                except Exception as exc:
+                    self._trace(
+                        f"[링크] {issue_key}: {key_upper} 상세 재조회 실패 "
+                        f"({type(exc).__name__}: {str(exc)[:160]})"
+                    )
 
         missing = []
         if not sw_voc_ok:
@@ -1828,7 +1905,20 @@ class JiraClient:
         if not has_detail_design:
             missing.append("Detail Design")
 
-        return {"missing": missing, "sw_voc_ok": sw_voc_ok}
+        self._trace(
+            f"[링크] {issue_key}: 최종 => "
+            f"SW_VOC={'OK' if sw_voc_ok else 'MISS'}, "
+            f"Function Requirement={'OK' if has_func_req else 'MISS'}, "
+            f"Detail Design={'OK' if has_detail_design else 'MISS'}"
+        )
+
+        return {
+            "missing": missing,
+            "sw_voc_ok": sw_voc_ok,
+            "function_requirement_ok": has_func_req,
+            "detail_design_ok": has_detail_design,
+            "checked": checked,
+        }
 
     @staticmethod
     def _extract_pull_requests_from_devstatus_payload(data) -> list[dict]:
