@@ -7,7 +7,7 @@ import html as _html
 import json
 import time
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, quote
 import time as _time
 
 
@@ -183,6 +183,30 @@ class JiraClient:
 
     def _auth(self):
         return HTTPBasicAuth(self.user, self.password)
+
+    def clear_trace(self):
+        """현재 worker thread의 진단 로그를 비운다."""
+        self._tls.trace_messages = []
+
+    def _trace(self, message: str):
+        """UI에 전달할 상세 진단 로그를 thread-local로 누적한다."""
+        try:
+            traces = getattr(self._tls, "trace_messages", None)
+            if traces is None:
+                traces = []
+                self._tls.trace_messages = traces
+            traces.append(str(message))
+        except Exception:
+            pass
+
+    def pop_trace(self) -> list[str]:
+        """현재 worker thread의 누적 진단 로그를 반환하고 비운다."""
+        try:
+            traces = list(getattr(self._tls, "trace_messages", []) or [])
+            self._tls.trace_messages = []
+            return traces
+        except Exception:
+            return []
 
     def _session(self) -> requests.Session:
         s = getattr(self._tls, "session", None)
@@ -389,8 +413,9 @@ class JiraClient:
         return f"{len(plain)} 자"
 
     def get_body_length_string_from_ui(self, issue_key: str) -> str:
-        """본문 길이 확인 - 최적화된 버전"""
-        # 1차: Description_Checker API 시도 (가장 빠름)
+        """본문 길이 확인 - API 우선, browse HTML fallback."""
+        self._trace(f"[본문길이] {issue_key}: 조회 시작")
+
         try:
             txt = self.get_text(
                 "/rest/scriptrunner/latest/custom/Description_Checker",
@@ -402,40 +427,52 @@ class JiraClient:
             )
             v = self._extract_len_string(txt)
             if v:
+                self._trace(f"[본문길이] {issue_key}: Description_Checker => {v}")
                 return v
             v2 = self._extract_len_string_from_description_checker_html(txt)
             if v2:
+                self._trace(f"[본문길이] {issue_key}: Description_Checker HTML => {v2}")
                 return v2
-        except Exception:
-            pass
+            self._trace(f"[본문길이] {issue_key}: Description_Checker 응답에서 길이 미검출")
+        except Exception as exc:
+            self._trace(
+                f"[본문길이] {issue_key}: Description_Checker 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
-        # 2차: browse HTML에서 "길이 확인" 링크 찾기
         try:
             browse_html = self.get_text(f"/browse/{issue_key}")
             if not browse_html:
+                self._trace(f"[본문길이] {issue_key}: browse HTML 비어 있음")
                 return ""
 
             candidates: list[str] = []
             for m in re.finditer(r'href="([^"]+)"[^>]*>\s*길이\s*확인\s*<', browse_html):
                 candidates.append(m.group(1))
-            
-            # 가장 가능성 높은 후보만 시도
+
+            self._trace(f"[본문길이] {issue_key}: 길이 확인 링크 후보={len(candidates)}")
             if candidates:
-                c = candidates[0]
-                c = _html.unescape(c)
-                c = c.replace("\\/", "/")
+                c = _html.unescape(candidates[0]).replace("\\/", "/")
                 if c.startswith("//"):
                     c = "https:" + c
                 try:
                     panel_txt = self.get_text(c)
                     v = self._extract_len_string(panel_txt)
                     if v:
+                        self._trace(f"[본문길이] {issue_key}: browse panel fallback => {v}")
                         return v
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        
+                except Exception as exc:
+                    self._trace(
+                        f"[본문길이] {issue_key}: browse panel 실패 "
+                        f"({type(exc).__name__}: {str(exc)[:140]})"
+                    )
+        except Exception as exc:
+            self._trace(
+                f"[본문길이] {issue_key}: browse fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
+
+        self._trace(f"[본문길이] {issue_key}: 최종 확인불가")
         return ""
 
     def _extract_tc_complete_count(self, txt: str) -> int:
@@ -931,59 +968,76 @@ class JiraClient:
         return int(best), counts
 
     def get_aio_test_validation(self, issue_key: str) -> dict:
+        self._trace(f"[AIO] {issue_key}: 검증 시작")
         issue_id = ""
         project_id = None
         try:
             issue_id, project_id = self._get_issue_meta_for_aio(issue_key)
-        except Exception:
+            self._trace(f"[AIO] {issue_key}: issue_id={issue_id or '-'}, project_id={project_id}")
+        except Exception as exc:
             issue_id, project_id = "", None
+            self._trace(
+                f"[AIO] {issue_key}: issue meta 조회 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
         actual, cycle_totals = self._get_aio_actual_count(issue_key, issue_id, project_id)
+        self._trace(f"[AIO] {issue_key}: actual={actual}, 후보={cycle_totals}")
 
         diff = self.get_issue_difficulty(issue_key)
         required = self.DIFFICULTY_MIN_CASES.get(diff)
+        self._trace(f"[AIO] {issue_key}: difficulty={diff or '-'}, required={required}")
 
-        # 테스트 케이스가 실제로 존재하면 난이도 필드 추출 실패만으로 FAIL 처리하지 않는다.
-        # 이 경우 최소 개수 비교 기준이 없으므로 OK(actual/-)로 표시한다.
         if not diff or required is None:
             if actual is not None and int(actual) > 0:
-                return {
+                result = {
                     "difficulty": diff,
                     "required": required,
                     "actual": int(actual),
                     "ok": True,
                     "status": f"OK({int(actual)}/-)",
+                    "verdict": "OK",
                     "cycle_totals": cycle_totals,
                 }
-            return {
-                "difficulty": diff,
-                "required": required,
-                "actual": None,
-                "ok": False,
-                "status": "ERR(NO LEVEL)",
-                "cycle_totals": cycle_totals,
-            }
+            else:
+                result = {
+                    "difficulty": diff,
+                    "required": required,
+                    "actual": None,
+                    "ok": False,
+                    "status": "N/A(NO LEVEL)",
+                    "verdict": "N/A",
+                    "cycle_totals": cycle_totals,
+                }
+            self._trace(f"[AIO] {issue_key}: 최종 => {result['status']}")
+            return result
 
         if actual is None:
-            return {
+            result = {
                 "difficulty": diff,
-                "required": required,
+                "required": int(required),
                 "actual": None,
                 "ok": False,
-                "status": f"ERR(API/-/{required})",
+                "status": f"N/A(API/-/{int(required)})",
+                "verdict": "N/A",
                 "cycle_totals": cycle_totals,
             }
+            self._trace(f"[AIO] {issue_key}: 최종 => {result['status']}")
+            return result
 
         ok = int(actual) >= int(required)
         status = ("OK" if ok else "FAIL") + f"({int(actual)}/{int(required)})"
-        return {
+        result = {
             "difficulty": diff,
             "required": int(required),
             "actual": int(actual),
             "ok": ok,
             "status": status,
+            "verdict": "OK" if ok else "FAIL",
             "cycle_totals": cycle_totals,
         }
+        self._trace(f"[AIO] {issue_key}: 최종 => {status}")
+        return result
 
     @staticmethod
     def _parse_tc_generation_status(data=None, text: str = "") -> dict:
@@ -1118,40 +1172,59 @@ class JiraClient:
         return data, text
 
     def get_tc_generation_check(self, issue_key: str) -> dict:
+        self._trace(f"[LLM TC] {issue_key}: 검증 시작")
         data = None
         text = ""
         try:
             data, text = self._post_tc_status_payload(issue_key)
-        except Exception:
+            self._trace(f"[LLM TC] {issue_key}: CheckTCStatus API 응답 수신")
+        except Exception as exc:
             data, text = None, ""
+            self._trace(
+                f"[LLM TC] {issue_key}: CheckTCStatus API 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
         parsed = self._parse_tc_generation_status(data, text)
+        self._trace(f"[LLM TC] {issue_key}: API parse={parsed}")
         if parsed.get("ok"):
             return parsed
         if int(parsed.get("failed_count", 0) or 0) > 0 or int(parsed.get("in_progress_count", 0) or 0) > 0:
             return parsed
 
-        # API 응답이 비어 있거나 불완전한 경우 화면 HTML/생성된 AIO TC를 fallback으로 확인한다.
         try:
             html = self.get_text(f"/browse/{issue_key}")
-        except Exception:
+            self._trace(f"[LLM TC] {issue_key}: browse HTML fallback 조회")
+        except Exception as exc:
             html = ""
+            self._trace(
+                f"[LLM TC] {issue_key}: browse fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
+
         html_parsed = self._parse_tc_generation_status(None, html)
+        self._trace(f"[LLM TC] {issue_key}: HTML parse={html_parsed}")
         if html_parsed.get("ok"):
             return html_parsed
         if int(html_parsed.get("failed_count", 0) or 0) > 0 or int(html_parsed.get("in_progress_count", 0) or 0) > 0:
             return html_parsed
 
-        # LLM History API가 빈 값이더라도 AIO TestCase가 실제 생성되어 있으면 생성 완료로 본다.
-        # 사용자 화면의 AMAMRAPP-602처럼 History 완료 + AIO TC 존재인데 CheckTCStatus만 0으로 내려오는 케이스 방어.
         try:
             issue_id, project_id = self._get_issue_meta_for_aio(issue_key)
             actual, _ = self._get_aio_actual_count(issue_key, issue_id, project_id)
-        except Exception:
+        except Exception as exc:
             actual = None
-        if actual is not None and int(actual) > 0:
-            return {"complete_count": 1, "in_progress_count": 0, "failed_count": 0, "ok": True}
+            self._trace(
+                f"[LLM TC] {issue_key}: AIO TC fallback 실패 "
+                f"({type(exc).__name__}: {str(exc)[:140]})"
+            )
 
+        if actual is not None and int(actual) > 0:
+            result = {"complete_count": 1, "in_progress_count": 0, "failed_count": 0, "ok": True}
+            self._trace(f"[LLM TC] {issue_key}: AIO TC {actual}건 존재 => OK fallback")
+            return result
+
+        self._trace(f"[LLM TC] {issue_key}: 최종 => {parsed}")
         return parsed
 
     def get_error_table_ok(self, issue_key: str, desc: str | None = None) -> bool:
@@ -1290,6 +1363,7 @@ class JiraClient:
         if ok:
             if debug:
                 print(f"[DEBUG STATUS] 표에 데이터 있음 → 'OK' 반환")
+            self._trace(f"[연관에러] {issue_key}: 표 데이터 존재 => OK")
             return "OK"
 
         # 사유 텍스트 탐지
@@ -1304,10 +1378,12 @@ class JiraClient:
         if has_reason:
             if debug:
                 print(f"[DEBUG STATUS] 최종 결과: '사유 작성'")
+            self._trace(f"[연관에러] {issue_key}: 표 데이터 없음, 사유 텍스트 존재 => 사유 작성")
             return "사유 작성"
         
         if debug:
             print(f"[DEBUG STATUS] 최종 결과: 'FAIL'")
+        self._trace(f"[연관에러] {issue_key}: 표 데이터/사유 없음 => FAIL")
         return "FAIL"
 
     def get_design_rollout_status(self, issue_key: str, desc: str | None = None, debug: bool = False) -> str:
@@ -1332,6 +1408,7 @@ class JiraClient:
         if ok:
             if debug:
                 print(f"[DEBUG STATUS] 표에 데이터 있음 → 'OK' 반환")
+            self._trace(f"[횡전개] {issue_key}: 표 데이터 존재 => OK")
             return "OK"
 
         if debug:
@@ -1345,10 +1422,12 @@ class JiraClient:
         if has_reason:
             if debug:
                 print(f"[DEBUG STATUS] 최종 결과: '사유 작성'")
+            self._trace(f"[횡전개] {issue_key}: 표 데이터 없음, 사유 텍스트 존재 => 사유 작성")
             return "사유 작성"
         
         if debug:
             print(f"[DEBUG STATUS] 최종 결과: 'FAIL'")
+        self._trace(f"[횡전개] {issue_key}: 표 데이터/사유 없음 => FAIL")
         return "FAIL"
 
     def _has_reason_text_around_table(self, desc, heading_candidates: list[str], debug=False) -> bool:
@@ -1736,9 +1815,8 @@ class JiraClient:
     def get_link_validation(self, issue_key: str, links=None) -> dict:
         """이슈 링크 검증.
 
-        확인된 Jira 화면 기준:
-          - SW_VOC는 `is child of`뿐 아니라 `relates to`에도 연결될 수 있다.
-          - 따라서 inwardIssue/outwardIssue 양쪽을 모두 보며, 상대 이슈의 issuetype/name 또는 key로 판별한다.
+        embedded issuelinks 응답의 fields가 축약되어 issuetype이 누락될 수 있으므로,
+        1차 embedded 판정 후 미충족 항목이 있으면 연결 이슈 key로 상세 정보를 재조회한다.
         """
         if links is None:
             data = self.get(
@@ -1747,45 +1825,123 @@ class JiraClient:
             )
             links = (data.get("fields") or {}).get("issuelinks") or []
 
+        links = links or []
+        self._trace(f"[링크] {issue_key}: issuelinks {len(links)}건 검사 시작")
+
         sw_voc_ok = False
         has_func_req = False
         has_detail_design = False
+        checked: list[dict] = []
+        linked_by_key: dict[str, dict] = {}
 
         def _norm(value) -> str:
             return str(value or "").strip().lower()
 
-        def _linked_issue_info(issue: dict) -> tuple[str, str]:
+        def _token(value) -> str:
+            return re.sub(r"[^a-z0-9가-힣]", "", _norm(value))
+
+        def _issue_type_name(issue: dict) -> str:
             fields = issue.get("fields") or {}
-            issue_type = ((fields.get("issuetype") or {}).get("name") or "")
-            key = issue.get("key") or ""
-            return _norm(issue_type), _norm(key)
+            raw = fields.get("issuetype")
+            if isinstance(raw, dict):
+                return str(raw.get("name") or raw.get("value") or "")
+            return str(raw or "")
+
+        def _issue_summary(issue: dict) -> str:
+            fields = issue.get("fields") or {}
+            return str(fields.get("summary") or "")
 
         def _is_sw_voc(issue_type: str, key: str) -> bool:
-            # 사내 SW_VOC 이슈는 화면/툴팁상 SW_VOC로 표시되고, 실제 key는 AMSWV-* 형태도 사용된다.
-            if "sw_voc" in issue_type or "sw voc" in issue_type:
+            t = _token(issue_type)
+            k = _norm(key)
+            if "swvoc" in t or ("voc" in t and "sw" in t):
                 return True
-            if "voc" in issue_type and "sw" in issue_type:
-                return True
-            if key.startswith("amswv-") or key.startswith("swvoc-") or key.startswith("sw_voc-"):
-                return True
-            return False
+            return k.startswith(("amswv-", "swvoc-", "sw_voc-"))
 
+        def _is_function_requirement(issue_type: str) -> bool:
+            t = _token(issue_type)
+            return "functionrequirement" in t or "functionalrequirement" in t
+
+        def _is_detail_design(issue_type: str) -> bool:
+            t = _token(issue_type)
+            return "detaildesign" in t or "detaileddesign" in t
+
+        def classify(key: str, issue_type: str, summary: str, source: str, relation: str = ""):
+            nonlocal sw_voc_ok, has_func_req, has_detail_design
+            sw = _is_sw_voc(issue_type, key)
+            fr = _is_function_requirement(issue_type)
+            dd = _is_detail_design(issue_type)
+            sw_voc_ok = sw_voc_ok or sw
+            has_func_req = has_func_req or fr
+            has_detail_design = has_detail_design or dd
+            checked.append({
+                "key": key,
+                "issue_type": issue_type,
+                "summary": summary,
+                "source": source,
+                "relation": relation,
+                "sw_voc": sw,
+                "function_requirement": fr,
+                "detail_design": dd,
+            })
+            self._trace(
+                f"[링크] {issue_key}: {key or '-'} type='{issue_type or '-'}' "
+                f"relation='{relation or '-'}' source={source} "
+                f"=> SW_VOC={sw}, Function Requirement={fr}, Detail Design={dd}"
+            )
+
+        # 1차: issuelinks embedded fields로 판정
         for link in links:
-            # SW_VOC / Function Requirement / Detail Design 모두 link 방향과 link type에 의존하지 않고
-            # 실제 연결된 상대 이슈의 타입/키를 기준으로 판단한다.
+            link_type = link.get("type") if isinstance(link.get("type"), dict) else {}
+            relation = " / ".join(
+                str(v) for v in (
+                    link_type.get("name"),
+                    link_type.get("inward"),
+                    link_type.get("outward"),
+                ) if v
+            )
             for side_key in ("inwardIssue", "outwardIssue"):
                 side = link.get(side_key)
-                if not side:
+                if not isinstance(side, dict):
                     continue
+                key = str(side.get("key") or "").strip()
+                if key:
+                    linked_by_key.setdefault(key.upper(), side)
+                classify(
+                    key,
+                    _issue_type_name(side),
+                    _issue_summary(side),
+                    "embedded",
+                    relation,
+                )
 
-                issue_type, key = _linked_issue_info(side)
-
-                if _is_sw_voc(issue_type, key):
-                    sw_voc_ok = True
-                if "function requirement" in issue_type or "function_requirement" in issue_type:
-                    has_func_req = True
-                if "detail design" in issue_type or "detail_design" in issue_type:
-                    has_detail_design = True
+        # 2차: 하나라도 미충족이면 연결 이슈 상세를 key 기준으로 재조회.
+        # Jira search/core 응답이 linked issue fields를 축약하는 환경에서 발생하는 false missing 방지.
+        if linked_by_key and not (sw_voc_ok and has_func_req and has_detail_design):
+            self._trace(
+                f"[링크] {issue_key}: embedded 판정 미충족 "
+                f"(SW_VOC={sw_voc_ok}, Function Requirement={has_func_req}, Detail Design={has_detail_design}) "
+                f"=> 연결 이슈 상세 재조회"
+            )
+            for key_upper, embedded in linked_by_key.items():
+                try:
+                    detail = self.get(
+                        f"/rest/api/2/issue/{key_upper}",
+                        params={"fields": "issuetype,summary"},
+                    ) or {}
+                    classify(
+                        str(detail.get("key") or key_upper),
+                        _issue_type_name(detail),
+                        _issue_summary(detail),
+                        "issue-detail",
+                    )
+                    if sw_voc_ok and has_func_req and has_detail_design:
+                        break
+                except Exception as exc:
+                    self._trace(
+                        f"[링크] {issue_key}: {key_upper} 상세 재조회 실패 "
+                        f"({type(exc).__name__}: {str(exc)[:160]})"
+                    )
 
         missing = []
         if not sw_voc_ok:
@@ -1795,7 +1951,20 @@ class JiraClient:
         if not has_detail_design:
             missing.append("Detail Design")
 
-        return {"missing": missing, "sw_voc_ok": sw_voc_ok}
+        self._trace(
+            f"[링크] {issue_key}: 최종 => "
+            f"SW_VOC={'OK' if sw_voc_ok else 'MISS'}, "
+            f"Function Requirement={'OK' if has_func_req else 'MISS'}, "
+            f"Detail Design={'OK' if has_detail_design else 'MISS'}"
+        )
+
+        return {
+            "missing": missing,
+            "sw_voc_ok": sw_voc_ok,
+            "function_requirement_ok": has_func_req,
+            "detail_design_ok": has_detail_design,
+            "checked": checked,
+        }
 
     @staticmethod
     def _extract_pull_requests_from_devstatus_payload(data) -> list[dict]:
@@ -1827,8 +1996,15 @@ class JiraClient:
         def add_pr(pr):
             if not isinstance(pr, dict):
                 return
-            pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or id(pr)
-            key = str(pid)
+            repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+            project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+            pid = pr.get("id") or pr.get("pullRequestId") or pr.get("prId") or pr.get("pr_id") or ""
+            url = pr.get("url") or pr.get("href") or ""
+            repo = repository.get("slug") or repository.get("name") or pr.get("repositorySlug") or ""
+            project_key = project.get("key") or project.get("name") or pr.get("projectKey") or ""
+            key = "|".join(str(x or "").strip().lower() for x in (project_key, repo, url, pid))
+            if not key.strip("|"):
+                key = str(pr.get("name") or pr.get("title") or id(pr))
             if key in seen:
                 return
             seen.add(key)
@@ -1893,6 +2069,519 @@ class JiraClient:
             return "UNKNOWN"
         return s or "UNKNOWN"
 
+
+    @staticmethod
+    def _extract_pr_url(pr: dict) -> str:
+        """PR 객체에서 pull request URL을 재귀적으로 찾는다."""
+        if not isinstance(pr, dict):
+            return ""
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for key in ("url", "href"):
+                    value = obj.get(key)
+                    if isinstance(value, str) and "pull" in value.lower():
+                        return value
+                for value in obj.values():
+                    found = walk(value)
+                    if found:
+                        return found
+            elif isinstance(obj, list):
+                for value in obj:
+                    found = walk(value)
+                    if found:
+                        return found
+            return ""
+
+        return walk(pr)
+
+    @classmethod
+    def _pr_identity_key(cls, pr: dict) -> str:
+        """저장소가 다른 동일 PR 번호가 충돌하지 않도록 PR 식별키를 만든다."""
+        if not isinstance(pr, dict):
+            return str(pr)
+
+        repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+        project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+        project_key = (
+            project.get("key")
+            or project.get("name")
+            or pr.get("projectKey")
+            or pr.get("project")
+            or ""
+        )
+        repo_slug = (
+            repository.get("slug")
+            or repository.get("name")
+            or pr.get("repositorySlug")
+            or pr.get("repoSlug")
+            or ""
+        )
+        pr_id = (
+            pr.get("id")
+            or pr.get("pullRequestId")
+            or pr.get("prId")
+            or pr.get("pr_id")
+            or pr.get("pullrequest_id")
+            or ""
+        )
+        pr_url = cls._extract_pr_url(pr)
+
+        parts = [str(project_key or "").strip().lower(),
+                 str(repo_slug or "").strip().lower(),
+                 str(pr_url or "").strip().lower(),
+                 str(pr_id or "").strip()]
+        if any(parts):
+            return "|".join(parts)
+        try:
+            return json.dumps(pr, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            return str(pr)
+
+    @staticmethod
+    def _canonical_reviewer_key(participant: dict) -> str:
+        """동일 승인자가 여러 응답에 중복 등장해도 한 명으로 세기 위한 사용자 키."""
+        if not isinstance(participant, dict):
+            return ""
+        user = participant.get("user") if isinstance(participant.get("user"), dict) else participant
+        if not isinstance(user, dict):
+            return ""
+
+        # dev-status와 Bitbucket participants 응답 사이에서 id가 생략되는 경우가 있어
+        # 계정 문자열 계열을 먼저 사용하고 numeric id는 후순위 fallback으로 둔다.
+        for field in ("slug", "name", "emailAddress", "email", "id", "displayName"):
+            value = user.get(field)
+            if value is None:
+                continue
+            text = str(value).strip().lower()
+            if text:
+                return f"{field.lower()}:{text}"
+        return ""
+
+    @staticmethod
+    def _is_approved_review_state(participant: dict) -> bool:
+        """APPROVED만 승인으로 본다. UNAPPROVED 문자열 부분 일치는 허용하지 않는다."""
+        if not isinstance(participant, dict):
+            return False
+        if participant.get("approved") is True:
+            return True
+
+        for field in ("status", "approvalStatus", "reviewStatus", "state"):
+            value = participant.get(field)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("value") or value.get("status") or value.get("state")
+            state = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+            if state in {"APPROVED", "APPROVE"}:
+                return True
+        return False
+
+    @staticmethod
+    def _is_reviewer_participant(participant: dict, source: str = "participants") -> bool:
+        if not isinstance(participant, dict):
+            return False
+        role = participant.get("role")
+        if isinstance(role, dict):
+            role = role.get("name") or role.get("value") or role.get("role")
+        role_text = str(role or "").strip().upper()
+        if role_text:
+            return role_text == "REVIEWER"
+        # reviewers 컨테이너에 들어 있는 항목은 role 필드가 생략될 수 있다.
+        return source == "reviewers"
+
+    @classmethod
+    def _approved_reviewer_keys(cls, entries: list[tuple[dict, str]]) -> set[str]:
+        approved: set[str] = set()
+        for participant, source in entries:
+            if not cls._is_reviewer_participant(participant, source):
+                continue
+            if not cls._is_approved_review_state(participant):
+                continue
+            key = cls._canonical_reviewer_key(participant)
+            if key:
+                approved.add(key)
+        return approved
+
+    @classmethod
+    def _extract_embedded_reviewer_entries(cls, pr: dict) -> tuple[list[tuple[dict, str]], bool]:
+        """dev-status PR 객체 안의 participants/reviewers를 재귀적으로 모은다."""
+        entries: list[tuple[dict, str]] = []
+        found_container = False
+
+        def add_items(value, source: str):
+            nonlocal found_container
+            found_container = True
+            if isinstance(value, list):
+                items = value
+            elif isinstance(value, dict):
+                for child_key in ("values", "items", "data", "results", "content"):
+                    child = value.get(child_key)
+                    if isinstance(child, list):
+                        items = child
+                        break
+                else:
+                    items = [value]
+            else:
+                items = []
+
+            for item in items:
+                if isinstance(item, dict):
+                    entries.append((item, source))
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    kl = str(key).lower()
+                    if kl in {"participants", "participant"}:
+                        add_items(value, "participants")
+                    elif kl in {"reviewers", "reviewer"}:
+                        add_items(value, "reviewers")
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    walk(value)
+
+        walk(pr)
+        return entries, found_container
+
+    @classmethod
+    def _bitbucket_pr_locator(cls, pr: dict):
+        """Bitbucket Server/Data Center PR의 host/owner/repo/id를 추출한다."""
+        if not isinstance(pr, dict):
+            return None
+
+        url = cls._extract_pr_url(pr)
+        parsed = urlparse(url) if url else None
+        owner_kind = ""
+        owner_value = ""
+        repo_slug = ""
+        pr_id = ""
+
+        if parsed and parsed.scheme and parsed.netloc:
+            match = re.search(
+                r"/(projects|users)/([^/]+)/repos/([^/]+)/pull-requests/(\d+)",
+                parsed.path or "",
+                flags=re.IGNORECASE,
+            )
+            if match:
+                owner_kind = (match.group(1) or "").lower()
+                owner_value = match.group(2) or ""
+                repo_slug = match.group(3) or ""
+                pr_id = match.group(4) or ""
+
+        repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+        project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+
+        if not owner_value:
+            owner_value = str(project.get("key") or pr.get("projectKey") or "")
+            if owner_value:
+                owner_kind = "projects"
+
+        repo_slug = repo_slug or str(
+            repository.get("slug")
+            or pr.get("repositorySlug")
+            or pr.get("repoSlug")
+            or ""
+        )
+        pr_id = pr_id or str(
+            pr.get("id")
+            or pr.get("pullRequestId")
+            or pr.get("prId")
+            or pr.get("pr_id")
+            or ""
+        )
+
+        if not (parsed and parsed.scheme and parsed.netloc and owner_kind and owner_value and repo_slug and pr_id):
+            return None
+
+        return {
+            "base_url": f"{parsed.scheme}://{parsed.netloc}",
+            "owner_kind": owner_kind,
+            "owner_value": owner_value,
+            "project_key": owner_value if owner_kind == "projects" else f"~{owner_value}",
+            "repo_slug": repo_slug,
+            "pr_id": pr_id,
+        }
+
+    @staticmethod
+    def _bitbucket_pr_api_url(locator: dict, suffix: str = "") -> str:
+        base = str(locator.get("base_url") or "").rstrip("/")
+        owner_kind = "users" if str(locator.get("owner_kind") or "").lower() == "users" else "projects"
+        owner_value = quote(str(locator.get("owner_value") or ""), safe="")
+        repo_slug = quote(str(locator.get("repo_slug") or ""), safe="")
+        pr_id = quote(str(locator.get("pr_id") or ""), safe="")
+        url = (
+            f"{base}/rest/api/1.0/{owner_kind}/{owner_value}/repos/{repo_slug}"
+            f"/pull-requests/{pr_id}"
+        )
+        suffix = str(suffix or "").strip("/")
+        return f"{url}/{suffix}" if suffix else url
+
+    def _fetch_bitbucket_pr_detail_once(self, pr: dict):
+        """Bitbucket의 표준 PR detail endpoint를 1회 조회한다."""
+        locator = self._bitbucket_pr_locator(pr)
+        if not locator:
+            return None, "locator_unavailable"
+
+        url = self._bitbucket_pr_api_url(locator)
+        try:
+            response = self._session().get(
+                url,
+                timeout=self.timeout,
+                headers={"Accept": "application/json"},
+            )
+        except Exception as exc:
+            return None, f"request_error:{type(exc).__name__}"
+
+        if response.status_code in (401, 403):
+            return None, f"permission:{response.status_code}"
+        if response.status_code == 404:
+            return None, "not_found"
+        try:
+            response.raise_for_status()
+            data = response.json() if (response.text or "").strip() else {}
+        except Exception:
+            return None, "invalid_response"
+
+        if not isinstance(data, dict) or not data:
+            return None, "invalid_response"
+        return data, None
+
+    def _fetch_bitbucket_participants_once(self, pr: dict):
+        """버전에 따라 제공되는 participants list endpoint fallback."""
+        locator = self._bitbucket_pr_locator(pr)
+        if not locator:
+            return None, "locator_unavailable"
+
+        url = self._bitbucket_pr_api_url(locator, "participants")
+        out: list[dict] = []
+        start = 0
+        seen_starts = set()
+
+        while True:
+            if start in seen_starts:
+                return None, "pagination_loop"
+            seen_starts.add(start)
+
+            try:
+                response = self._session().get(
+                    url,
+                    params={"start": start, "limit": 100},
+                    timeout=self.timeout,
+                    headers={"Accept": "application/json"},
+                )
+            except Exception as exc:
+                return None, f"request_error:{type(exc).__name__}"
+
+            if response.status_code in (401, 403):
+                return None, f"permission:{response.status_code}"
+            if response.status_code == 404:
+                return None, "not_found"
+            try:
+                response.raise_for_status()
+                data = response.json() if (response.text or "").strip() else {}
+            except Exception:
+                return None, "invalid_response"
+
+            # 일부 버전은 list를 직접 반환할 수 있다.
+            if isinstance(data, list):
+                out.extend(item for item in data if isinstance(item, dict))
+                break
+
+            values = data.get("values") if isinstance(data, dict) else None
+            if not isinstance(values, list):
+                return None, "invalid_response"
+            out.extend(item for item in values if isinstance(item, dict))
+
+            if data.get("isLastPage") is True:
+                break
+            next_start = data.get("nextPageStart")
+            if next_start is None:
+                break
+            try:
+                next_start = int(next_start)
+            except Exception:
+                return None, "invalid_pagination"
+            if next_start == start:
+                return None, "pagination_loop"
+            start = next_start
+
+        return out, None
+
+    def _review_approval_for_pr(self, pr: dict, required_count: int = 2) -> dict:
+        """한 PR의 서로 다른 승인 reviewer 수를 안정적으로 계산한다.
+
+        우선순위:
+          1) Bitbucket 표준 PR detail endpoint의 reviewers/participants
+          2) participants list endpoint (지원 버전 fallback)
+          3) Jira dev-status PR 객체에 포함된 reviewers/participants
+        """
+        required_count = max(1, int(required_count or 2))
+        embedded_entries, embedded_known = self._extract_embedded_reviewer_entries(pr)
+        embedded_keys = self._approved_reviewer_keys(embedded_entries)
+        pr_key = self._pr_identity_key(pr)
+
+        self._trace(
+            f"[PR승인] {pr_key}: dev-status reviewer container={embedded_known}, "
+            f"approved={len(embedded_keys)}"
+        )
+
+        locator = self._bitbucket_pr_locator(pr)
+        direct_signatures: list[tuple[str, ...]] = []
+        direct_sources: list[str] = []
+        last_error = None
+
+        if locator:
+            self._trace(
+                f"[PR승인] {pr_key}: Bitbucket locator "
+                f"{locator.get('owner_kind')}/{locator.get('owner_value')}/"
+                f"{locator.get('repo_slug')} PR#{locator.get('pr_id')}"
+            )
+            for attempt in range(1, 4):
+                keys: set[str] | None = None
+                source = ""
+
+                # Bitbucket Server/Data Center에서 가장 안정적인 표준 PR detail API 우선.
+                detail, detail_err = self._fetch_bitbucket_pr_detail_once(pr)
+                if isinstance(detail, dict):
+                    detail_entries, detail_known = self._extract_embedded_reviewer_entries(detail)
+                    if detail_known:
+                        keys = self._approved_reviewer_keys(detail_entries)
+                        source = "bitbucket-pr-detail"
+                        if embedded_known:
+                            keys |= embedded_keys
+                            source += "+devstatus"
+                    else:
+                        detail_err = "reviewer_container_missing"
+
+                # 구/특정 버전의 participants endpoint fallback.
+                if keys is None:
+                    participants, participants_err = self._fetch_bitbucket_participants_once(pr)
+                    if participants is not None:
+                        entries = [(item, "participants") for item in participants]
+                        keys = self._approved_reviewer_keys(entries)
+                        source = "bitbucket-participants"
+                        if embedded_known:
+                            keys |= embedded_keys
+                            source += "+devstatus"
+                        last_error = None
+                    else:
+                        last_error = participants_err or detail_err
+                else:
+                    last_error = None
+
+                if keys is None:
+                    self._trace(
+                        f"[PR승인] {pr_key}: 직접조회 {attempt}/3 실패 "
+                        f"(detail={detail_err}, fallback={last_error})"
+                    )
+                    continue
+
+                signature = tuple(sorted(keys))
+                direct_signatures.append(signature)
+                direct_sources.append(source)
+                self._trace(
+                    f"[PR승인] {pr_key}: 직접조회 {attempt}/3 source={source}, "
+                    f"approved={len(keys)}/{required_count}"
+                )
+
+                # 승인 충족 결과는 2회 동일 확인 후 확정.
+                if direct_signatures.count(signature) >= 2:
+                    count = len(keys)
+                    result = {
+                        "ok": count >= required_count,
+                        "count": count,
+                        "required": required_count,
+                        "complete": True,
+                        "source": source,
+                        "reviewers": sorted(keys),
+                    }
+                    self._trace(
+                        f"[PR승인] {pr_key}: 안정 판정 => "
+                        f"{'OK' if result['ok'] else 'FAIL'}({count}/{required_count})"
+                    )
+                    return result
+
+        # 직접 조회가 있었지만 값이 흔들리면 순간값으로 FAIL 처리하지 않는다.
+        if direct_signatures:
+            best = max((set(sig) for sig in direct_signatures), key=len, default=set())
+            self._trace(
+                f"[PR승인] {pr_key}: 직접조회 결과 불일치 "
+                f"{[len(x) for x in direct_signatures]} => N/A"
+            )
+            return {
+                "ok": False,
+                "count": len(best),
+                "required": required_count,
+                "complete": False,
+                "source": "bitbucket_unstable",
+                "reviewers": sorted(best),
+                "reason": "unstable",
+            }
+
+        # 직접 조회가 불가능해도 Jira dev-status가 reviewer 정보를 명시적으로 주면 사용.
+        if embedded_known:
+            count = len(embedded_keys)
+            result = {
+                "ok": count >= required_count,
+                "count": count,
+                "required": required_count,
+                "complete": True,
+                "source": "devstatus",
+                "reviewers": sorted(embedded_keys),
+                "reason": last_error,
+            }
+            self._trace(
+                f"[PR승인] {pr_key}: dev-status fallback => "
+                f"{'OK' if result['ok'] else 'FAIL'}({count}/{required_count})"
+            )
+            return result
+
+        self._trace(
+            f"[PR승인] {pr_key}: 승인정보 확인불가 "
+            f"(reason={last_error or 'reviewer_data_unavailable'})"
+        )
+        return {
+            "ok": False,
+            "count": 0,
+            "required": required_count,
+            "complete": False,
+            "source": "unavailable",
+            "reviewers": [],
+            "reason": last_error or "reviewer_data_unavailable",
+        }
+
+    def _summarize_pr_review_approval(self, prs: list[dict], required_count: int = 2) -> str:
+        """연결 PR 중 병합된 PR을 우선으로 리뷰 승인 충족 여부를 요약한다."""
+        unique_prs: list[dict] = []
+        seen = set()
+        for pr in prs or []:
+            if not isinstance(pr, dict):
+                continue
+            key = self._pr_identity_key(pr)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_prs.append(pr)
+
+        if not unique_prs:
+            return "리뷰승인 N/A(확인불가)"
+
+        merged = [pr for pr in unique_prs if self._normalize_pr_status(pr) == "MERGED"]
+        candidates = merged or unique_prs
+        results = [self._review_approval_for_pr(pr, required_count) for pr in candidates]
+
+        for result in results:
+            if result.get("ok") is True and result.get("complete") is True:
+                return f"리뷰승인 OK({result.get('count', 0)}/{result.get('required', required_count)})"
+
+        complete_results = [r for r in results if r.get("complete") is True]
+        if complete_results:
+            best = max(complete_results, key=lambda r: int(r.get("count") or 0))
+            return f"리뷰승인 FAIL({best.get('count', 0)}/{best.get('required', required_count)})"
+
+        return "리뷰승인 N/A(확인불가)"
+
     def _get_devstatus_app_types(self, issue_id: str) -> tuple[list[str], int, bool]:
         """dev-status summary에서 PR applicationType 후보와 overall count를 얻는다."""
         app_types: list[str] = []
@@ -1944,12 +2633,21 @@ class JiraClient:
         # 사내 Bitbucket Server 계열까지 기본 후보에 포함
         for at in ("bitbucketserver", "stash", "bitbucket", "github", "gitlab", "fecru"):
             add_app_type(at)
+        self._trace(
+            f"[PR] dev-status summary issue_id={issue_id}: overall={overall_count}, "
+            f"appTypes={app_types}, summary_error={had_error}"
+        )
         return app_types, overall_count, had_error
 
     def get_pr_merge_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
         """병합된 PR이 1개 이상인지 확인."""
         status = self.get_pr_merge_status(issue_key, issue_id)
         return "MERGED" in str(status or "").upper()
+
+    def get_pr_gate_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
+        """최종 PR gate: 병합 + 서로 다른 reviewer 2명 승인 모두 충족."""
+        status = str(self.get_pr_merge_status(issue_key, issue_id) or "")
+        return "MERGED" in status.upper() and "리뷰승인 OK(" in status
 
     def get_pr_merge_status(self, issue_key: str, issue_id: str | None = None) -> str:
         """PR 상태 요약 문자열을 반환한다.
@@ -1958,6 +2656,7 @@ class JiraClient:
         재귀적으로 PR 객체를 수집한다.
         """
         try:
+            self._trace(f"[PR] {issue_key}: 병합/승인 검증 시작 (issue_id={issue_id or '-'})")
             if not issue_id:
                 try:
                     issue_data = self.get(f"/rest/api/2/issue/{issue_key}", params={"fields": "id"})
@@ -1976,6 +2675,7 @@ class JiraClient:
             any_no_permission = False
             any_error = bool(summary_error)
             seen_pr = set()
+            pr_records: list[dict] = []
 
             for app_type in app_types_to_try:
                 try:
@@ -1989,13 +2689,14 @@ class JiraClient:
                     ) or {}
                     any_success = True
                     prs = self._extract_pull_requests_from_devstatus_payload(data)
+                    self._trace(f"[PR] {issue_key}: appType={app_type} PR 추출={len(prs)}건")
                     for pr in prs:
-                        pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or str(pr)
-                        pid = str(pid)
+                        pid = self._pr_identity_key(pr)
                         if pid in seen_pr:
                             continue
                         seen_pr.add(pid)
                         total_pr += 1
+                        pr_records.append(pr)
                         st = self._normalize_pr_status(pr)
                         counts[st] = counts.get(st, 0) + 1
                 except requests.HTTPError as e:
@@ -2030,8 +2731,14 @@ class JiraClient:
             for k in sorted(counts.keys()):
                 if k not in order:
                     parts.append(f"{k}({counts[k]})")
-            return ",".join(parts)
-        except Exception:
+
+            merge_summary = ",".join(parts)
+            review_summary = self._summarize_pr_review_approval(pr_records, required_count=2)
+            final = f"{merge_summary} / {review_summary}"
+            self._trace(f"[PR] {issue_key}: 최종 => {final}")
+            return final
+        except Exception as exc:
+            self._trace(f"[PR] {issue_key}: 예외 => {type(exc).__name__}: {str(exc)[:200]}")
             return "ERR"
 
     def get_sccb_target_checks(self, issue_key: str) -> dict:
@@ -2067,7 +2774,7 @@ class JiraClient:
             futures["rollout"] = executor.submit(self.get_design_rollout_ok, issue_key, desc)
             futures["link"] = executor.submit(self.get_link_validation, issue_key, issuelinks)
             futures["tc"] = executor.submit(self.get_tc_generation_check, issue_key)
-            futures["pr_merge"] = executor.submit(self.get_pr_merge_ok, issue_key, issue_id)
+            futures["pr_merge"] = executor.submit(self.get_pr_gate_ok, issue_key, issue_id)
 
             # AIO/PR은 여러 endpoint를 순회하므로 timeout을 넉넉하게 준다.
             SLOW_KEYS = {"tc", "pr_merge"}

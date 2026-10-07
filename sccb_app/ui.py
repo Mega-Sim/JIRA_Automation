@@ -738,92 +738,208 @@ class JiraSccbApp(tb.Window):
                         self.log(f"Core 데이터 배치 조회 실패, 개별 조회로 진행: {e}")
 
                     def fetch_and_set(k: str, iid: str):
+                        jira.clear_trace()
                         try:
-                            # 1) 공통 데이터(Description/IssueLinks/IssueID) - 캐시 사용
+                            # 1) 공통 데이터(Description/IssueLinks/IssueID)
                             core = core_cache.get(k)
+                            core_source = "batch"
                             if not core:
                                 core = jira.get_issue_core(k)
-                            
+                                core_source = "individual"
+
                             fields = (core.get('fields') or {})
                             desc = fields.get('description') or ''
                             issuelinks = fields.get('issuelinks') or []
                             issue_id = core.get('id') or ''
 
-                            # 2) 네트워크 없이 계산 가능한 항목을 먼저 반영
+                            # 2) 빠른 검증
                             rollout_status = None
                             err_status = None
-                            missing = None
-                            try:
-                                rollout_status = jira.get_design_rollout_status(k, desc=desc) if hasattr(jira, 'get_design_rollout_status') else ('OK' if jira.get_design_rollout_ok(k, desc=desc) else 'FAIL')
-                            except Exception:
-                                rollout_status = None
-                            try:
-                                err_status = jira.get_error_table_status(k, desc=desc) if hasattr(jira, 'get_error_table_status') else ('OK' if jira.get_error_table_ok(k, desc=desc) else 'FAIL')
-                            except Exception:
-                                err_status = None
-                            try:
-                                missing = (jira.get_link_validation(k, links=issuelinks).get('missing') or [])
-                            except Exception:
-                                missing = None
+                            link_res = None
+                            fast_errors = []
 
-                            def _apply_fast():
+                            try:
+                                rollout_status = (
+                                    jira.get_design_rollout_status(k, desc=desc)
+                                    if hasattr(jira, 'get_design_rollout_status')
+                                    else ('OK' if jira.get_design_rollout_ok(k, desc=desc) else 'FAIL')
+                                )
+                            except Exception as exc:
+                                fast_errors.append(f"횡전개:{type(exc).__name__}:{str(exc)[:160]}")
+
+                            try:
+                                err_status = (
+                                    jira.get_error_table_status(k, desc=desc)
+                                    if hasattr(jira, 'get_error_table_status')
+                                    else ('OK' if jira.get_error_table_ok(k, desc=desc) else 'FAIL')
+                                )
+                            except Exception as exc:
+                                fast_errors.append(f"연관에러:{type(exc).__name__}:{str(exc)[:160]}")
+
+                            try:
+                                link_res = jira.get_link_validation(k, links=issuelinks)
+                            except Exception as exc:
+                                fast_errors.append(f"이슈연결:{type(exc).__name__}:{str(exc)[:160]}")
+
+                            missing = None if not isinstance(link_res, dict) else (link_res.get('missing') or [])
+
+                            def _apply_fast(
+                                core_source=core_source,
+                                issue_id=issue_id,
+                                issuelinks=issuelinks,
+                                rollout_status=rollout_status,
+                                err_status=err_status,
+                                link_res=link_res,
+                                missing=missing,
+                                fast_errors=tuple(fast_errors),
+                            ):
                                 if iid not in self.iid_by_key.values():
                                     return
+
+                                self.log(
+                                    f"[검증 시작] {k}: core={core_source}, issue_id={issue_id or '-'}, "
+                                    f"issuelinks={len(issuelinks)}"
+                                )
+
                                 self.tree.set(iid, 'rollout', 'ERR' if rollout_status is None else rollout_status)
+                                self.log(f"[횡전개] {k}: {rollout_status if rollout_status is not None else 'ERR'}")
+
                                 self.tree.set(iid, 'err_table', 'ERR' if err_status is None else err_status)
+                                self.log(f"[연관 에러] {k}: {err_status if err_status is not None else 'ERR'}")
+
                                 if missing is None:
                                     self.tree.set(iid, 'links', 'ERR')
+                                    self.log(f"[이슈 연결] {k}: ERR")
                                 elif missing:
-                                    self.tree.set(iid, 'links', 'Missing: ' + ','.join(missing))
+                                    link_text = 'Missing: ' + ','.join(missing)
+                                    self.tree.set(iid, 'links', link_text)
+                                    self.log(f"[이슈 연결] {k}: {link_text}")
                                 else:
                                     self.tree.set(iid, 'links', 'OK')
+                                    self.log(f"[이슈 연결] {k}: OK")
+
+                                if isinstance(link_res, dict):
+                                    self.log(
+                                        f"[이슈 연결 상세] {k}: "
+                                        f"SW_VOC={link_res.get('sw_voc_ok')}, "
+                                        f"Function Requirement={link_res.get('function_requirement_ok')}, "
+                                        f"Detail Design={link_res.get('detail_design_ok')}, "
+                                        f"checked={len(link_res.get('checked') or [])}"
+                                    )
+
+                                for err in fast_errors:
+                                    self.log(f"[검증 예외] {k}: {err}")
+
                                 self._apply_zebra()
 
                             self.after(0, _apply_fast)
 
-                            # 3) 느린 항목 - 원본 로직 그대로 유지
-                            def _safe_call(fn, *args, **kwargs):
+                            # 3) 느린 검증
+                            call_errors = []
+
+                            def _safe_call(label, fn, *args, **kwargs):
                                 try:
                                     return fn(*args, **kwargs)
-                                except Exception:
+                                except Exception as exc:
+                                    call_errors.append(
+                                        f"{label}:{type(exc).__name__}:{str(exc)[:180]}"
+                                    )
                                     return None
 
-                            # 본문 길이 - 2회 재시도 (권한없음이면 즉시 중단)
+                            # 본문 길이 - 2회 재시도
                             body_len = None
+                            body_attempts = 0
                             for _ in range(2):
-                                body_len = _safe_call(jira.get_body_length_string_from_ui, k)
+                                body_attempts += 1
+                                body_len = _safe_call("본문길이", jira.get_body_length_string_from_ui, k)
                                 if body_len:
                                     break
                                 if body_len == 'N/A(권한없음)':
                                     break
-                            
-                            # TC, AIO, PR - 원본 그대로
-                            tc_res = _safe_call(jira.get_tc_generation_check, k)
-                            aio_res = _safe_call(jira.get_aio_test_validation, k)
-                            pr_res = _safe_call(jira.get_pr_merge_status, k, issue_id)
 
-                            def _apply_slow(body_len=body_len, tc_res=tc_res, aio_res=aio_res, pr_res=pr_res):
+                            tc_res = _safe_call("LLM TC", jira.get_tc_generation_check, k)
+                            aio_res = _safe_call("AIO Test", jira.get_aio_test_validation, k)
+                            pr_res = _safe_call("PR", jira.get_pr_merge_status, k, issue_id)
+
+                            trace_lines = jira.pop_trace()
+
+                            def _apply_slow(
+                                body_len=body_len,
+                                body_attempts=body_attempts,
+                                tc_res=tc_res,
+                                aio_res=aio_res,
+                                pr_res=pr_res,
+                                call_errors=tuple(call_errors),
+                                trace_lines=tuple(trace_lines),
+                            ):
                                 if iid not in self.iid_by_key.values():
                                     return
-                                self.tree.set(iid, 'body_len', body_len if body_len is not None and body_len != '' else '확인불가')
+
+                                body_display = body_len if body_len is not None and body_len != '' else '확인불가'
+                                self.tree.set(iid, 'body_len', body_display)
+                                self.log(f"[본문 길이] {k}: {body_display} (시도={body_attempts})")
+
                                 tc_ok = bool((tc_res or {}).get('ok', False))
-                                self.tree.set(iid, 'tcgen', 'OK' if tc_ok else 'FAIL')
+                                tc_display = 'OK' if tc_ok else 'FAIL'
+                                self.tree.set(iid, 'tcgen', tc_display)
+                                self.log(
+                                    f"[LLM TC] {k}: {tc_display} "
+                                    f"(complete={(tc_res or {}).get('complete_count', 0)}, "
+                                    f"in_progress={(tc_res or {}).get('in_progress_count', 0)}, "
+                                    f"failed={(tc_res or {}).get('failed_count', 0)})"
+                                )
+
                                 aio_status = (aio_res or {}).get('status') or 'ERR'
                                 self.tree.set(iid, 'aio_test', aio_status)
-                                self.tree.set(iid, 'pr_merge', pr_res if pr_res is not None else 'ERR')
+                                self.log(
+                                    f"[AIO Test] {k}: {aio_status} "
+                                    f"(level={(aio_res or {}).get('difficulty') or '-'}, "
+                                    f"actual={(aio_res or {}).get('actual')}, "
+                                    f"required={(aio_res or {}).get('required')}, "
+                                    f"verdict={(aio_res or {}).get('verdict') or '-'})"
+                                )
+
+                                pr_display = pr_res if pr_res is not None else 'ERR'
+                                self.tree.set(iid, 'pr_merge', pr_display)
+                                self.log(f"[PR 병합/승인] {k}: {pr_display}")
+
+                                for line in trace_lines:
+                                    self.log(f"[상세] {k}: {line}")
+                                for err in call_errors:
+                                    self.log(f"[검증 예외] {k}: {err}")
+
+                                rollout_now = self.tree.set(iid, 'rollout')
+                                err_now = self.tree.set(iid, 'err_table')
+                                links_now = self.tree.set(iid, 'links')
+                                final_result = self._calc_row_result(
+                                    rollout_now,
+                                    err_now,
+                                    links_now,
+                                    tc_display,
+                                    aio_status,
+                                    pr_display,
+                                )
+                                self.log(f"[검증 완료] {k}: RESULT={final_result}")
                                 self._apply_zebra()
 
                             self.after(0, _apply_slow)
 
-                        except Exception:
-                            # 어떤 예외도 전체 진행을 멈추지 않게 방어
-                            def _apply_err():
+                        except Exception as exc:
+                            trace_lines = jira.pop_trace()
+
+                            def _apply_err(exc=exc, trace_lines=tuple(trace_lines)):
                                 if iid not in self.iid_by_key.values():
                                     return
                                 for col in ('body_len','rollout','err_table','links','tcgen','aio_test','pr_merge'):
                                     if not self.tree.set(iid, col):
                                         self.tree.set(iid, col, 'ERR')
+                                self.log(
+                                    f"[검증 치명 오류] {k}: {type(exc).__name__}: {str(exc)[:300]}"
+                                )
+                                for line in trace_lines:
+                                    self.log(f"[상세] {k}: {line}")
                                 self._apply_zebra()
+
                             self.after(0, _apply_err)
                         finally:
                             completed[0] += 1
@@ -868,10 +984,27 @@ class JiraSccbApp(tb.Window):
             return "FAIL"
         if not tcgen or "OK" not in (tcgen or "").upper():
             return "FAIL"
-        if not aio_test or 'OK' not in (aio_test or '').upper():
-            return 'FAIL'
-        if not pr_merge or "MERGED" not in (pr_merge or "").upper():
-            if pr_merge and "N/A" in pr_merge.upper():
+        aio_text = str(aio_test or "")
+        aio_upper = aio_text.upper()
+        if not aio_text:
+            return "N/A"
+        if "N/A" in aio_upper or "확인불가" in aio_text:
+            return "N/A"
+        if "OK" not in aio_upper:
+            return "FAIL"
+        pr_text = str(pr_merge or "")
+        pr_upper = pr_text.upper()
+        if not pr_text or "MERGED" not in pr_upper:
+            if "N/A" in pr_upper:
+                return "N/A"
+            return "FAIL"
+
+        # 최종 RESULT는 PR 병합뿐 아니라 서로 다른 reviewer 2명 승인까지 충족해야 OK.
+        # 이전 실행본의 병합 문자열만 남아 있는 경우 승인 검증을 건너뛰지 않고 확인불가로 둔다.
+        if "리뷰승인" not in pr_text:
+            return "N/A"
+        if "리뷰승인 OK(" not in pr_text:
+            if "N/A" in pr_upper or "확인불가" in pr_text:
                 return "N/A"
             return "FAIL"
         return "OK"
