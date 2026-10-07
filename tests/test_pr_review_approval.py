@@ -130,7 +130,7 @@ class PrReviewApprovalTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertTrue(result["complete"])
         self.assertTrue(result["ok"])
-        self.assertEqual("bitbucket", result["source"])
+        self.assertEqual("bitbucket-participants", result["source"])
         self.assertEqual(2, result["count"])
 
     def test_unstable_direct_reads_are_unknown_not_fail(self):
@@ -199,6 +199,52 @@ class PrReviewApprovalTests(unittest.TestCase):
 
         client.get_pr_merge_status = lambda issue_key, issue_id=None: "OPEN(1) / 리뷰승인 OK(2/2)"
         self.assertFalse(client.get_pr_gate_ok("AMVCS30-56"))
+
+    def test_standard_bitbucket_pr_detail_reads_two_approvals(self):
+        client = make_client()
+        pr = {
+            "id": 56,
+            "status": "MERGED",
+            "url": "https://bitbucket.example.com/projects/AMHS/repos/vcs/pull-requests/56/overview",
+        }
+        detail = {
+            "id": 56,
+            "state": "MERGED",
+            "reviewers": [
+                reviewer(101, approved=True),
+                reviewer(202, approved=True),
+            ],
+        }
+        calls = []
+
+        def fake_detail(_pr):
+            calls.append(1)
+            return detail, None
+
+        client._fetch_bitbucket_pr_detail_once = fake_detail
+        client._fetch_bitbucket_participants_once = lambda _pr: (None, "should_not_be_needed")
+
+        result = client._review_approval_for_pr(pr, required_count=2)
+
+        self.assertEqual(2, len(calls))
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["count"])
+        self.assertEqual("bitbucket-pr-detail", result["source"])
+
+    def test_user_repository_locator_keeps_users_api_shape(self):
+        client = make_client()
+        pr = {
+            "id": 7,
+            "url": "https://bitbucket.example.com/users/tester/repos/tool/pull-requests/7/overview",
+        }
+
+        locator = client._bitbucket_pr_locator(pr)
+        url = client._bitbucket_pr_api_url(locator)
+
+        self.assertEqual("users", locator["owner_kind"])
+        self.assertEqual("tester", locator["owner_value"])
+        self.assertIn("/rest/api/1.0/users/tester/repos/tool/pull-requests/7", url)
 
 
 if __name__ == "__main__":
