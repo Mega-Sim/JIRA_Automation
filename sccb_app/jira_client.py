@@ -2193,34 +2193,37 @@ class JiraClient:
 
     @classmethod
     def _bitbucket_pr_locator(cls, pr: dict):
-        """Bitbucket Server/Data Center PR의 base/project/repo/id를 추출한다."""
+        """Bitbucket Server/Data Center PR의 host/owner/repo/id를 추출한다."""
         if not isinstance(pr, dict):
             return None
 
         url = cls._extract_pr_url(pr)
         parsed = urlparse(url) if url else None
-        project_key = ""
+        owner_kind = ""
+        owner_value = ""
         repo_slug = ""
         pr_id = ""
 
         if parsed and parsed.scheme and parsed.netloc:
             match = re.search(
-                r"/(?:projects/([^/]+)|users/([^/]+))/repos/([^/]+)/pull-requests/(\d+)",
+                r"/(projects|users)/([^/]+)/repos/([^/]+)/pull-requests/(\d+)",
                 parsed.path or "",
                 flags=re.IGNORECASE,
             )
             if match:
-                project_key = match.group(1) or (f"~{match.group(2)}" if match.group(2) else "")
+                owner_kind = (match.group(1) or "").lower()
+                owner_value = match.group(2) or ""
                 repo_slug = match.group(3) or ""
                 pr_id = match.group(4) or ""
 
         repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
         project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
-        project_key = project_key or str(
-            project.get("key")
-            or pr.get("projectKey")
-            or ""
-        )
+
+        if not owner_value:
+            owner_value = str(project.get("key") or pr.get("projectKey") or "")
+            if owner_value:
+                owner_kind = "projects"
+
         repo_slug = repo_slug or str(
             repository.get("slug")
             or pr.get("repositorySlug")
@@ -2235,33 +2238,69 @@ class JiraClient:
             or ""
         )
 
-        if not (parsed and parsed.scheme and parsed.netloc and project_key and repo_slug and pr_id):
+        if not (parsed and parsed.scheme and parsed.netloc and owner_kind and owner_value and repo_slug and pr_id):
             return None
+
         return {
             "base_url": f"{parsed.scheme}://{parsed.netloc}",
-            "project_key": project_key,
+            "owner_kind": owner_kind,
+            "owner_value": owner_value,
+            "project_key": owner_value if owner_kind == "projects" else f"~{owner_value}",
             "repo_slug": repo_slug,
             "pr_id": pr_id,
         }
 
-    def _fetch_bitbucket_participants_once(self, pr: dict):
-        """Bitbucket participants API 전체 페이지를 1회 조회한다.
+    @staticmethod
+    def _bitbucket_pr_api_url(locator: dict, suffix: str = "") -> str:
+        base = str(locator.get("base_url") or "").rstrip("/")
+        owner_kind = "users" if str(locator.get("owner_kind") or "").lower() == "users" else "projects"
+        owner_value = quote(str(locator.get("owner_value") or ""), safe="")
+        repo_slug = quote(str(locator.get("repo_slug") or ""), safe="")
+        pr_id = quote(str(locator.get("pr_id") or ""), safe="")
+        url = (
+            f"{base}/rest/api/1.0/{owner_kind}/{owner_value}/repos/{repo_slug}"
+            f"/pull-requests/{pr_id}"
+        )
+        suffix = str(suffix or "").strip("/")
+        return f"{url}/{suffix}" if suffix else url
 
-        성공 시 (participants, None), 식별/권한/조회 실패 시 (None, reason)를 반환한다.
-        """
+    def _fetch_bitbucket_pr_detail_once(self, pr: dict):
+        """Bitbucket의 표준 PR detail endpoint를 1회 조회한다."""
         locator = self._bitbucket_pr_locator(pr)
         if not locator:
             return None, "locator_unavailable"
 
-        base = locator["base_url"].rstrip("/")
-        project_key = quote(str(locator["project_key"]), safe="~")
-        repo_slug = quote(str(locator["repo_slug"]), safe="")
-        pr_id = quote(str(locator["pr_id"]), safe="")
-        url = (
-            f"{base}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}"
-            f"/pull-requests/{pr_id}/participants"
-        )
+        url = self._bitbucket_pr_api_url(locator)
+        try:
+            response = self._session().get(
+                url,
+                timeout=self.timeout,
+                headers={"Accept": "application/json"},
+            )
+        except Exception as exc:
+            return None, f"request_error:{type(exc).__name__}"
 
+        if response.status_code in (401, 403):
+            return None, f"permission:{response.status_code}"
+        if response.status_code == 404:
+            return None, "not_found"
+        try:
+            response.raise_for_status()
+            data = response.json() if (response.text or "").strip() else {}
+        except Exception:
+            return None, "invalid_response"
+
+        if not isinstance(data, dict) or not data:
+            return None, "invalid_response"
+        return data, None
+
+    def _fetch_bitbucket_participants_once(self, pr: dict):
+        """버전에 따라 제공되는 participants list endpoint fallback."""
+        locator = self._bitbucket_pr_locator(pr)
+        if not locator:
+            return None, "locator_unavailable"
+
+        url = self._bitbucket_pr_api_url(locator, "participants")
         out: list[dict] = []
         start = 0
         seen_starts = set()
@@ -2278,11 +2317,11 @@ class JiraClient:
                     timeout=self.timeout,
                     headers={"Accept": "application/json"},
                 )
-            except Exception:
-                return None, "request_error"
+            except Exception as exc:
+                return None, f"request_error:{type(exc).__name__}"
 
             if response.status_code in (401, 403):
-                return None, "permission"
+                return None, f"permission:{response.status_code}"
             if response.status_code == 404:
                 return None, "not_found"
             try:
@@ -2290,6 +2329,11 @@ class JiraClient:
                 data = response.json() if (response.text or "").strip() else {}
             except Exception:
                 return None, "invalid_response"
+
+            # 일부 버전은 list를 직접 반환할 수 있다.
+            if isinstance(data, list):
+                out.extend(item for item in data if isinstance(item, dict))
+                break
 
             values = data.get("values") if isinstance(data, dict) else None
             if not isinstance(values, list):
@@ -2312,42 +2356,106 @@ class JiraClient:
         return out, None
 
     def _review_approval_for_pr(self, pr: dict, required_count: int = 2) -> dict:
-        """한 PR의 서로 다른 승인 reviewer 수를 안정적으로 계산한다."""
+        """한 PR의 서로 다른 승인 reviewer 수를 안정적으로 계산한다.
+
+        우선순위:
+          1) Bitbucket 표준 PR detail endpoint의 reviewers/participants
+          2) participants list endpoint (지원 버전 fallback)
+          3) Jira dev-status PR 객체에 포함된 reviewers/participants
+        """
         required_count = max(1, int(required_count or 2))
         embedded_entries, embedded_known = self._extract_embedded_reviewer_entries(pr)
         embedded_keys = self._approved_reviewer_keys(embedded_entries)
+        pr_key = self._pr_identity_key(pr)
+
+        self._trace(
+            f"[PR승인] {pr_key}: dev-status reviewer container={embedded_known}, "
+            f"approved={len(embedded_keys)}"
+        )
 
         locator = self._bitbucket_pr_locator(pr)
         direct_signatures: list[tuple[str, ...]] = []
+        direct_sources: list[str] = []
         last_error = None
 
         if locator:
-            for _ in range(3):
-                participants, err = self._fetch_bitbucket_participants_once(pr)
-                last_error = err
-                if participants is None:
+            self._trace(
+                f"[PR승인] {pr_key}: Bitbucket locator "
+                f"{locator.get('owner_kind')}/{locator.get('owner_value')}/"
+                f"{locator.get('repo_slug')} PR#{locator.get('pr_id')}"
+            )
+            for attempt in range(1, 4):
+                keys: set[str] | None = None
+                source = ""
+
+                # Bitbucket Server/Data Center에서 가장 안정적인 표준 PR detail API 우선.
+                detail, detail_err = self._fetch_bitbucket_pr_detail_once(pr)
+                if isinstance(detail, dict):
+                    detail_entries, detail_known = self._extract_embedded_reviewer_entries(detail)
+                    if detail_known:
+                        keys = self._approved_reviewer_keys(detail_entries)
+                        source = "bitbucket-pr-detail"
+                        if embedded_known:
+                            keys |= embedded_keys
+                            source += "+devstatus"
+                    else:
+                        detail_err = "reviewer_container_missing"
+
+                # 구/특정 버전의 participants endpoint fallback.
+                if keys is None:
+                    participants, participants_err = self._fetch_bitbucket_participants_once(pr)
+                    if participants is not None:
+                        entries = [(item, "participants") for item in participants]
+                        keys = self._approved_reviewer_keys(entries)
+                        source = "bitbucket-participants"
+                        if embedded_known:
+                            keys |= embedded_keys
+                            source += "+devstatus"
+                        last_error = None
+                    else:
+                        last_error = participants_err or detail_err
+                else:
+                    last_error = None
+
+                if keys is None:
+                    self._trace(
+                        f"[PR승인] {pr_key}: 직접조회 {attempt}/3 실패 "
+                        f"(detail={detail_err}, fallback={last_error})"
+                    )
                     continue
-                entries = [(item, "participants") for item in participants]
-                keys = self._approved_reviewer_keys(entries)
+
                 signature = tuple(sorted(keys))
                 direct_signatures.append(signature)
+                direct_sources.append(source)
+                self._trace(
+                    f"[PR승인] {pr_key}: 직접조회 {attempt}/3 source={source}, "
+                    f"approved={len(keys)}/{required_count}"
+                )
 
-                # 동일 결과가 2회 확인되면 안정된 값으로 채택한다.
+                # 승인 충족 결과는 2회 동일 확인 후 확정.
                 if direct_signatures.count(signature) >= 2:
                     count = len(keys)
-                    return {
+                    result = {
                         "ok": count >= required_count,
                         "count": count,
                         "required": required_count,
                         "complete": True,
-                        "source": "bitbucket",
+                        "source": source,
                         "reviewers": sorted(keys),
                     }
+                    self._trace(
+                        f"[PR승인] {pr_key}: 안정 판정 => "
+                        f"{'OK' if result['ok'] else 'FAIL'}({count}/{required_count})"
+                    )
+                    return result
 
-        # 직접 조회가 한 번이라도 됐지만 3회 내 동일 결과 2회를 확보하지 못하면
-        # 임의의 순간값으로 FAIL 처리하지 않는다.
+        # 직접 조회가 있었지만 값이 흔들리면 순간값으로 FAIL 처리하지 않는다.
         if direct_signatures:
             best = max((set(sig) for sig in direct_signatures), key=len, default=set())
+            self._trace(
+                f"[PR승인] {pr_key}: 직접조회 결과 불일치 "
+                f"{[len(x) for x in direct_signatures]} => N/A"
+            )
             return {
                 "ok": False,
                 "count": len(best),
@@ -2358,11 +2466,10 @@ class JiraClient:
                 "reason": "unstable",
             }
 
-        # Bitbucket 직접 조회가 불가능한 환경에서는 dev-status가 명시적으로
-        # participants/reviewers 컨테이너를 제공한 경우에만 그 값을 사용한다.
+        # 직접 조회가 불가능해도 Jira dev-status가 reviewer 정보를 명시적으로 주면 사용.
         if embedded_known:
             count = len(embedded_keys)
-            return {
+            result = {
                 "ok": count >= required_count,
                 "count": count,
                 "required": required_count,
@@ -2371,7 +2478,16 @@ class JiraClient:
                 "reviewers": sorted(embedded_keys),
                 "reason": last_error,
             }
+            self._trace(
+                f"[PR승인] {pr_key}: dev-status fallback => "
+                f"{'OK' if result['ok'] else 'FAIL'}({count}/{required_count})"
+            )
+            return result
 
+        self._trace(
+            f"[PR승인] {pr_key}: 승인정보 확인불가 "
+            f"(reason={last_error or 'reviewer_data_unavailable'})"
+        )
         return {
             "ok": False,
             "count": 0,
