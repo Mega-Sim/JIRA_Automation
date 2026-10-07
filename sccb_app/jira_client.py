@@ -1950,8 +1950,15 @@ class JiraClient:
         def add_pr(pr):
             if not isinstance(pr, dict):
                 return
-            pid = pr.get("id") or pr.get("pullRequestId") or pr.get("url") or pr.get("name") or pr.get("title") or id(pr)
-            key = str(pid)
+            repository = pr.get("repository") if isinstance(pr.get("repository"), dict) else {}
+            project = repository.get("project") if isinstance(repository.get("project"), dict) else {}
+            pid = pr.get("id") or pr.get("pullRequestId") or pr.get("prId") or pr.get("pr_id") or ""
+            url = pr.get("url") or pr.get("href") or ""
+            repo = repository.get("slug") or repository.get("name") or pr.get("repositorySlug") or ""
+            project_key = project.get("key") or project.get("name") or pr.get("projectKey") or ""
+            key = "|".join(str(x or "").strip().lower() for x in (project_key, repo, url, pid))
+            if not key.strip("|"):
+                key = str(pr.get("name") or pr.get("title") or id(pr))
             if key in seen:
                 return
             seen.add(key)
@@ -2580,6 +2587,10 @@ class JiraClient:
         # 사내 Bitbucket Server 계열까지 기본 후보에 포함
         for at in ("bitbucketserver", "stash", "bitbucket", "github", "gitlab", "fecru"):
             add_app_type(at)
+        self._trace(
+            f"[PR] dev-status summary issue_id={issue_id}: overall={overall_count}, "
+            f"appTypes={app_types}, summary_error={had_error}"
+        )
         return app_types, overall_count, had_error
 
     def get_pr_merge_ok(self, issue_key: str, issue_id: str | None = None) -> bool:
@@ -2599,6 +2610,7 @@ class JiraClient:
         재귀적으로 PR 객체를 수집한다.
         """
         try:
+            self._trace(f"[PR] {issue_key}: 병합/승인 검증 시작 (issue_id={issue_id or '-'})")
             if not issue_id:
                 try:
                     issue_data = self.get(f"/rest/api/2/issue/{issue_key}", params={"fields": "id"})
@@ -2631,6 +2643,7 @@ class JiraClient:
                     ) or {}
                     any_success = True
                     prs = self._extract_pull_requests_from_devstatus_payload(data)
+                    self._trace(f"[PR] {issue_key}: appType={app_type} PR 추출={len(prs)}건")
                     for pr in prs:
                         pid = self._pr_identity_key(pr)
                         if pid in seen_pr:
@@ -2675,8 +2688,11 @@ class JiraClient:
 
             merge_summary = ",".join(parts)
             review_summary = self._summarize_pr_review_approval(pr_records, required_count=2)
-            return f"{merge_summary} / {review_summary}"
-        except Exception:
+            final = f"{merge_summary} / {review_summary}"
+            self._trace(f"[PR] {issue_key}: 최종 => {final}")
+            return final
+        except Exception as exc:
+            self._trace(f"[PR] {issue_key}: 예외 => {type(exc).__name__}: {str(exc)[:200]}")
             return "ERR"
 
     def get_sccb_target_checks(self, issue_key: str) -> dict:
