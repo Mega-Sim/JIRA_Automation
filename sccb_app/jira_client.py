@@ -184,6 +184,30 @@ class JiraClient:
     def _auth(self):
         return HTTPBasicAuth(self.user, self.password)
 
+    def clear_trace(self):
+        """현재 worker thread의 진단 로그를 비운다."""
+        self._tls.trace_messages = []
+
+    def _trace(self, message: str):
+        """UI에 전달할 상세 진단 로그를 thread-local로 누적한다."""
+        try:
+            traces = getattr(self._tls, "trace_messages", None)
+            if traces is None:
+                traces = []
+                self._tls.trace_messages = traces
+            traces.append(str(message))
+        except Exception:
+            pass
+
+    def pop_trace(self) -> list[str]:
+        """현재 worker thread의 누적 진단 로그를 반환하고 비운다."""
+        try:
+            traces = list(getattr(self._tls, "trace_messages", []) or [])
+            self._tls.trace_messages = []
+            return traces
+        except Exception:
+            return []
+
     def _session(self) -> requests.Session:
         s = getattr(self._tls, "session", None)
         if s is None:
